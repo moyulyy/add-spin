@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# VASP 运行产物
+INCAR
+KPOINTS
+POSCAR
+CONTCAR
+OUTCAR
+OSZICAR
+CHG
+CHGCAR
+WAVECAR
+DOSCAR
+EIGENVAL
+IBZKPT
+PCDAT
+XDATCAR
+vasprun.xml
+*.vasp
+
+# 示例/临时
+examples/
+_ex_tmp/
+_repo_tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
