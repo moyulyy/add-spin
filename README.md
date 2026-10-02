@@ -1,290 +1,112 @@
-<div align="center">
+# add-spin.py
 
-# 🧲 add-spin.py
+从 POSCAR 生成 VASP 共线自旋计算的 `ISPIN` 与逐原子 `MAGMOM` 初猜。脚本解析晶格、坐标和元素顺序，分析周期配位、真空方向与位点角色，再结合材料知识库、形式价态或可选的 LLM 工具调用生成方案。
 
-**从 POSCAR 一键生成 VASP 磁矩初猜（`ISPIN` / `MAGMOM`）**
+`MAGMOM` 是初始化参数，不能保证收敛到磁基态。比较 FM、AFM、亚铁磁和不同自旋态时，应分别开展一致参数下的 DFT 计算并比较收敛能量；LLM 的建议也需要同样验证。
 
-*LLM 工具调用 · bulk/slab 判别 · 晶体学位点磁性识别 · 铁磁/亚铁磁/反铁磁*
+运行依赖为 Python ≥ 3.9 与 NumPy。HTTP 请求使用 Python 标准库，无需安装 OpenAI SDK。
 
-[![Python](https://img.shields.io/badge/Python-%E2%89%A53.9-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![VASP](https://img.shields.io/badge/VASP-MAGMOM-1f6feb.svg)](https://www.vasp.at/)
-[![LLM](https://img.shields.io/badge/LLM-function%20calling-8A2BE2.svg)](#-llm-工具调用)
-[![Dependencies](https://img.shields.io/badge/deps-numpy%20only-success.svg)](https://numpy.org/)
-[![Single File](https://img.shields.io/badge/single--file-add--spin.py-blue.svg)](#-文件说明)
-
-</div>
-
----
-
-## ✨ 为什么需要它
-
-`MAGMOM` 初猜直接决定 VASP 能否收敛到正确的磁基态，尤其是**尖晶石/反尖晶石、
-钙钛矿、LDH、以及切面 slab**。旧式“一个元素一个固定值”的做法在复杂体系里经常出错：
-
-| 体系 | ❌ 按元素拍脑袋 | ✅ add-spin.py |
-|---|---|---|
-| 纯金属 **Pt** | 给 3 | 给 **0**（体相非磁） |
-| **Fe₃O₄** 反尖晶石 | 所有 Fe 都 +5 | 8a Fe **+5**、16d Fe **−5**（亚铁磁） |
-| **NiO** 岩盐 | 所有 Ni 都 +3 | Ni 亚晶格**正负交替**（II 型反铁磁） |
-| **MgAl₂O₄** 正尖晶石 | Al 也给 3 | **全 0** |
-| **Co₃O₄** | Co 全 +5 | 8a Co²⁺ ±3、16d Co³⁺ 低自旋 0 |
-| **NiO(001) slab** | 表面原子照抄体相 | 识别**表面/次表面**，表面 Ni 单独赋值 |
-| **ZnS / ZnO** | 乱给磁矩 | 判别闪锌矿/纤锌矿，**非磁 0** |
-| **LaFeO₃** 钙钛矿 | 所有原子都给值 | 仅 B 位 Fe 有磁矩，A 位 La = 0 |
-| **NiFe-LDH** | 分不清层板/层间 | 仅层板八面体金属有磁矩，层间物种 = 0 |
-
----
-
-## 📚 目录
-
-- [✨ 为什么需要它](#-为什么需要它)
-- [🚀 快速开始](#-快速开始)
-- [🧰 命令行](#-命令行)
-- [🔍 工作原理](#-工作原理)
-  - [体系类型判别 bulk / slab / molecule](#体系类型判别-bulk--slab--molecule)
-  - [结构基元识别](#结构基元识别)
-  - [反铁磁 / 亚铁磁符号](#反铁磁--亚铁磁符号)
-- [🤖 LLM 工具调用](#-llm-工具调用)
-- [🐍 作为 Python 模块](#-作为-python-模块)
-- [🧪 自检与示例](#-自检与示例)
-- [📁 文件说明](#-文件说明)
-- [⚠️ 注意事项](#️-注意事项)
-- [📄 许可](#-许可)
-
----
-
-## 🚀 快速开始
+## 快速开始
 
 ```bash
-# 查看全部参数
+# 查看帮助
 python add-spin.py --help
 
-# 用 LLM 分析 POSCAR，并追加写入 INCAR
-export DEEPSEEK_API_KEY=sk-xxxx        # 或 OPENAI_API_KEY / LLM_API_KEY
-python add-spin.py POSCAR
-
-# 只打印，不写文件
-python add-spin.py POSCAR --print
-
-# 不联网：内置知识库 + 晶体学启发式
+# 只分析并打印，不写 INCAR（离线启发式）
 python add-spin.py POSCAR --no-llm --print
 
-# 补充已知信息（会拼进提示词）
-python add-spin.py POSCAR --hint "Fe 为 +3 价，体系是 G 型反铁磁"
+# 调用 LLM 生成方案并更新 INCAR（需要 API Key）
+export LLM_API_KEY=...
+python add-spin.py POSCAR --incar INCAR
 
-# 任意 OpenAI 兼容服务
-python add-spin.py POSCAR --base-url https://api.deepseek.com/v1 --model deepseek-chat
-
-# 内置物理自检 / 导出示例结构
-python add-spin.py --self-test
-python add-spin.py --make-examples ./examples
+# 补充已知价态/磁序信息（仅传给 LLM）
+python add-spin.py POSCAR --hint "Ni 为 +2 价，反铁磁"
 ```
 
-> **依赖**：Python ≥ 3.9 + `numpy`。HTTP 调用使用标准库，**无需 openai SDK**。
+## LLM 配置
 
----
+连接与运行默认配置集中在 `add-spin.py` 头部的 `LLM_*` 常量中，紧随其后的 `SYSTEM_PROMPT` 定义 LLM 的分析与提交约束：
 
-## 🧰 命令行
+| 常量 | 默认值 | 用途 |
+|---|---|---|
+| `LLM_API_KEY` | 空字符串 | OpenAI 兼容服务的 API Key |
+| `LLM_BASE_URL` | `https://api.deepseek.com/v1` | 服务地址 |
+| `LLM_MODEL` | `deepseek-chat` | 模型名称 |
+| `LLM_TEMPERATURE` | `0.2` | 采样温度 |
+| `LLM_TIMEOUT` | `180` | 单次请求的超时秒数 |
+| `LLM_MAX_RETRIES` | `3` | 每轮请求的最大总尝试次数（含首次） |
+| `LLM_MAX_STEPS` | `8` | 工具调用最大轮数 |
 
-| 参数 | 说明 | 默认 |
-|:--|:--|:--|
-| `poscar` | POSCAR 路径（位置参数） | `POSCAR` |
-| `--incar FILE` | 追加写入的 INCAR | `INCAR` |
-| `--print` | 只打印，不写 INCAR | — |
-| `--no-llm` | 不调用 LLM，直接用内置启发式 | — |
-| `--hint TEXT` | 给 LLM 的补充说明（价态、磁序等） | — |
-| `--api-key` / `--base-url` / `--model` / `--temperature` | LLM 配置 | 环境变量 |
-| `--max-steps` | LLM 工具调用最大轮数 | `8` |
-| `--vacuum-threshold` | bulk/slab 判别的真空层阈值 (Å) | `5.0` |
-| `--quiet` | 不打印 LLM 过程 | — |
-| `--self-test` | 运行内置自检后退出 | — |
-| `--make-examples DIR` | 导出内置示例 POSCAR 后退出 | — |
+API Key、服务地址和模型名称的优先级为 **命令行参数 > 环境变量 > 脚本头部常量**。环境变量按下列顺序取第一个非空值：
+
+| 配置 | 环境变量 |
+|---|---|
+| API Key | `LLM_API_KEY`、`OPENAI_API_KEY`、`DEEPSEEK_API_KEY` |
+| 服务地址 | `LLM_BASE_URL`、`OPENAI_BASE_URL` |
+| 模型 | `LLM_MODEL` |
+
+温度、超时、重试和最大轮数直接使用头部常量，可由对应命令行参数覆盖。建议用环境变量保存密钥，避免将真实密钥写入版本库。使用 `--no-llm` 时仅运行本地分析；没有可用 API Key 或 LLM 调用失败时，程序尝试本地回退，但无法可靠构造方案时会报错。
+
+LLM 通过 `analyze_structure`、`get_element_info`、`lookup_known_material`、`preview_magmom` 和 `submit_magmom` 调用结构分析与方案校验工具。规则展开和原子顺序校验由脚本完成。
+
+## 命令行参数
+
+命令入口为 `python add-spin.py`，完整帮助可通过 `--help` 查看。
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `poscar` | POSCAR 路径，位置参数 | `POSCAR` |
+| `--incar FILE` | 要更新的 INCAR 路径 | `INCAR` |
+| `--print` | 只打印参数，不写入 INCAR | 关闭 |
+| `--no-llm` | 使用本地知识库与启发式 | 关闭 |
+| `--hint TEXT` | 传给 LLM 的已知价态、磁序等补充信息 | 空 |
+| `--api-key KEY` | 覆盖 API Key | 按配置优先级读取 |
+| `--base-url URL` | 覆盖服务地址 | 按配置优先级读取 |
+| `--model NAME` | 覆盖模型名称 | 按配置优先级读取 |
+| `--temperature FLOAT` | 覆盖采样温度 | `LLM_TEMPERATURE` |
+| `--timeout SECONDS` | 覆盖单次请求超时 | `LLM_TIMEOUT` |
+| `--max-retries N` | 覆盖每轮请求最大总尝试次数 | `LLM_MAX_RETRIES` |
+| `--max-steps N` | 覆盖工具调用最大轮数 | `LLM_MAX_STEPS` |
+| `--vacuum-threshold ANGSTROM` | 真空判别阈值，单位 Å | `5.0` |
+| `--quiet` | 减少 LLM 调用过程输出 | 关闭 |
 | `-h, --help` | 显示帮助 | — |
 
-### 环境变量
+`--hint` 仅供 LLM 使用，不会自动转成离线规则或强制约束。
 
-| 变量 | 说明 | 默认 |
-|:--|:--|:--|
-| `LLM_API_KEY` / `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` | API Key（任一） | — |
-| `LLM_BASE_URL` / `OPENAI_BASE_URL` | OpenAI 兼容地址 | `https://api.deepseek.com/v1` |
-| `LLM_MODEL` | 模型名 | `deepseek-chat` |
+## 磁性设置逻辑
 
-### 输出示例 · NiO(001) slab
+- **结构与化学环境**：按 POSCAR 中的原子顺序解析，保留重复元素块。配位分析计入周期镜像；体相、表面和分子的判别以及结构基元识别均为几何启发式，不能替代完整晶体学鉴定。
+- **磁矩幅值**：已知材料提供初猜参考。未知化合物仅在候选形式价态满足电荷中性且具有唯一解时使用对应离子自旋计数；价态不能唯一确定时，采用元素经验初猜，并明确磁序与价态尚未确定，不自动宣称 AFM 基态。
+- **自旋数据含义**：d 壳层高、低自旋表对应理想八面体晶体场；平方平面等配位需要另行判断。初猜使用自旋磁矩 `2S`，不使用顺磁有效磁矩 `sqrt(n(n+2))`。f 壳层数据是自旋计数，不包含 SOC 与轨道磁矩。
+- **位点匹配**：按元素、可选配位数和位点角色严格匹配。配位降低的表面原子不会自动继承某个体相位点；无法匹配时应补充明确规则或逐原子覆盖，避免把低配位八面体误认成四面体。
+- **AFM 符号**：自动二染色仅适用于当前周期晶胞的相容近邻图。岩盐 AFM-II 需满足相应磁周期约束。晶胞不能容纳该磁序、近邻图存在挫折或缺少磁序信息时，会要求构造合适超胞或提供明确的位点磁矩，不用任意正负交替冒充目标磁序。
+- **亚铁磁**：使用明确位点规则的正负号，保留不同亚晶格的相对方向。Fe₃O₄ 八面体 `4.5 μB` 是 Fe²⁺/Fe³⁺ 的平均初猜，不表示已解析低温电荷有序。
+- **分子**：不直接套用体相材料知识库。H₂ 和 O₂ 有专门处理；其他无法可靠确定自旋的分子或团簇需要明确的自旋信息，否则报错。
 
-```text
-Mag parameter
-   ISPIN = 2
-   # Ni(1)=2.5  O(1)=0  Ni(1)=-2  O(1)=0  Ni(1)=2  O(1)=0
-   MAGMOM =  2.5   0   -2   0   2   0
-```
+形式价态模型无法唯一描述共价性、混合价、电荷转移、缺陷、电荷有序或强关联自旋态。几何近邻关系也不能单独决定交换耦合符号。因此局域磁矩与磁序候选仍需根据具体研究对象确认。
 
----
+## 输出与校验
 
-## 🔍 工作原理
+默认全零磁矩输出 `ISPIN=1`，有非零磁矩输出 `ISPIN=2`；调用接口时也可显式保留全零 `ISPIN=2` 种子。程序检查逐原子磁矩数量、数值有限性、位点索引及规则覆盖，并保持输出与 POSCAR 的原子顺序一致。`ISPIN=1` 与非零磁矩等矛盾设置不会直接写出。
 
-### 体系类型判别 bulk / slab / molecule
+写入时更新已有 `ISPIN` / `MAGMOM`，清理重复的同名设置，保留 INCAR 的其他参数。检测到启用的 `LSORBIT`、`LNONCOLLINEAR` 或 `NUPDOWN` 约束时，拒绝将本工具的共线初猜直接写入，以免改变既有计算的含义。
 
-判别算法与 [`mk-KPOINTS`](https://github.com/moyulyy/mk-KPOINTS) 一致：
+本工具不生成非共线三分量磁矩、SOC 磁各向异性方案、自旋螺旋或磁性超胞。需要这些计算时，应按目标磁结构单独构造输入。
 
-1. 对 a / b / c 三方向，把分数坐标排序，求**最大周期空隙**（分数）；
-2. 空隙 × 晶格长度 = **真空层厚度**（Å）；
-3. 真空层 > 阈值（默认 5 Å）即认为该方向存在真空：
+## 开发验证
 
-| 条件 | 类型 |
-|:--|:--|
-| a、b、c 都有真空 | `mole` |
-| 只有 c 有真空 | `slab` |
-| 都无真空 | `bulk` |
-
-对 `slab` 进一步**几何分层**：由最大真空轴求表面法向 → 投影原子 → 聚类成原子层 →
-标记每位点的 `role`（`surface_top` / `surface_bottom` / `subsurface` / `interior`），
-并用 `cn_deficit`（该元素最大配位 − 本位点配位）标出配位不饱和位点。
-
-### 结构基元识别
-
-对**最大配位数**（而非表面瞬时配位）做判据，因此同一套逻辑对 bulk 与 slab 都成立：
-
-| family | 判据 | 磁性处理要点 |
-|:--|:--|:--|
-| `metal` | 单元素 | Fe/Co/Ni 铁磁；Cr/Mn 反铁磁；Pt/Pd/Cu/Ag/Au/Al 非磁 |
-| `spinel` | A:B:O = 1:2:4 | 按 8a(CN4)/16d(CN6) 分别赋值；正/反尖晶石自动判别 |
-| `perovskite` | ABO₃ | B 位(CN6) 有磁矩，A 位(CN≥8) = 0 |
-| `double_perovskite` | A₂BB′O₆ | B/B′ 常反平行（亚铁磁），如 Sr₂FeMoO₆ |
-| `rocksalt` | AO | MnO/FeO/CoO/NiO 反铁磁 |
-| `zincblende` / `wurtzite` | AB，阳离子 CN4 | ZnS/ZnO/GaAs 非磁；MnS/MnSe/MnTe 反铁磁 |
-| `ldh` / `hydroxide` | 含 H+O 的层板/水镁石 | 仅层板八面体金属有磁矩，层间物种 = 0 |
-| `corundum` / `rutile` | A₂O₃ / MO₂ | Cr₂O₃/Fe₂O₃ 反铁磁；CrO₂ 铁磁 |
-
-### 反铁磁 / 亚铁磁符号
-
-- **二部图晶格**（bcc、金刚石等）：3×3×3 超胞近邻图二染色；
-- **非二部图晶格**（fcc 岩盐 NiO、尖晶石八面体亚晶格）：**磁层投影**自动挑选方向，
-  按层号奇偶给 `±`（即 NiO 的 (111) 面内铁磁、面间反铁磁）；
-- **亚铁磁**（Fe₃O₄、NiFe₂O₄…）：直接给“8a 与 16d 整体反号”，不在 16d 内部交替；
-- 每个位点只应用一次符号，避免表面/内部规则互相覆盖。
-
----
-
-## 🤖 LLM 工具调用
-
-程序把结构分析封装成 5 个 function-calling 工具：
-
-| 工具 | 作用 |
-|:--|:--|
-| `analyze_structure()` | 体系类型、真空层、slab 分层、每位点配位数/几何/role、结构基元、知识库匹配 |
-| `get_element_info(symbol)` | 元素各价态/自旋态的未成对电子数与默认初猜 |
-| `lookup_known_material(formula_or_name)` | 内置材料知识库（50+ 条） |
-| `preview_magmom(...)` | 试算方案（返回按 `元素(CN,role)` 汇总 + 告警） |
-| `submit_magmom(...)` | 提交最终方案 |
-
-模型只需给出「按 **元素 + 配位数 + 位点角色** 的赋值规则」，由脚本展开到每个原子，避免顺序错位：
-
-```jsonc
-// 尖晶石 / 双钙钛矿 → 亚铁磁
-{
-  "assignments": [
-    {"element": "Fe", "coordination": 4, "moment":  5.0},   // 8a 四面体
-    {"element": "Fe", "coordination": 6, "moment": -5.0},   // 16d 八面体
-    {"element": "O",  "moment": 0.0}
-  ],
-  "magnetic_order": "ferrimagnetic"
-}
-
-// 岩盐反铁磁 → 自动正负交替
-{ "assignments": [{"element":"Ni","moment":2.0},{"element":"O","moment":0.0}],
-  "magnetic_order": "afm" }
-
-// slab：表面积配位不饱和位单独赋值
-{
-  "assignments": [
-    {"element":"Ni","site_role":"surface","moment": 2.5},
-    {"element":"Ni","moment": 2.0},
-    {"element":"O","moment": 0.0}
-  ],
-  "magnetic_order": "afm"
-}
-```
-
-<details>
-<summary><b>字段说明</b>（点击展开）</summary>
-
-- `assignments`：`element`（必需）、`coordination`、`site_role`、`moment`、`afm_group`
-- `site_role`：`any` / `surface` / `top_surface` / `bottom_surface` / `subsurface` /
-  `interior` / `bulk` / `cluster`
-- `magnetic_order`：`fm` / `afm` / `ferrimagnetic` / `nonmagnetic`
-- `submit_magmom` 还支持 `site_overrides`（单点覆盖）、`ispin`、`rationale`
-- **表面回退**：表面低配位会自动继承该元素最接近的体相“母配位数”规则，只写体相 CN 即可
-
-</details>
-
----
-
-## 🐍 作为 Python 模块
-
-```python
-import importlib.util
-
-spec = importlib.util.spec_from_file_location("add_spin", "add-spin.py")
-add_spin = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(add_spin)
-
-pos = add_spin.parse_poscar_full("POSCAR")      # 完整解析
-report = add_spin.analyze_structure(pos)
-print(report["system_type"], report["slab"])     # bulk / slab / mole、分层信息
-print(report["motif"]["name"], report["site_groups"])
-
-moments, why = add_spin.heuristic_plan(pos, report)
-print(add_spin.format_magmom(pos, moments))
-```
-
-<details>
-<summary><b>旧版 API 仍保留</b>（向后兼容 fast-vasp）</summary>
-
-```python
-pairs = add_spin.parse_poscar("POSCAR")   # -> [(元素, 数量), ...]
-block = add_spin.build_magmom(pairs)
-add_spin.append_magmom("POSCAR", "INCAR")
-```
-
-</details>
-
----
-
-## 🧪 自检与示例
+回归测试命令：
 
 ```bash
-python add-spin.py --self-test                  # 10 组结构物理自检
-python add-spin.py --make-examples ./examples   # 导出示例 POSCAR
+python -m unittest discover -s tests -v
 ```
 
-覆盖：Pt = 0、Fe 铁磁、NiO 反铁磁、NiO(001) slab 判别与表面磁矩、ZnS 闪锌矿非磁、
-ZnO 纤锌矿非磁、LaFeO₃ 钙钛矿、NiAl-LDH 层板磁性、Fe₃O₄ 反尖晶石、MgAl₂O₄ 正尖晶石。
+测试分三部分，均不联网：
 
----
+- `tests/test_add_spin.py`：POSCAR 解析（缩放、Cartesian/Direct、异常输入）、slab 分层与真空判据、磁矩方案校验、INCAR 更新与反铁磁周期相容性。
+- `tests/test_geometry_motif.py`：配位壳层与结构基元识别（bcc、金刚石、岩盐、钙钛矿、刚玉及尖晶石判据等）。
+- `tests/test_physics_and_cli.py`：离子自旋计数、分子特例、LLM 配置优先级与命令行失败路径。
 
-## 📁 文件说明
+主程序为 `add-spin.py`，测试位于 `tests`。旧模块接口 `parse_poscar`、`build_magmom`、`append_magmom` 保留兼容用途；只有元素数量的输入无法提供完整晶体环境，复杂磁性体系应使用完整 POSCAR 分析流程。
 
-```text
-add-spin.py    单文件实现（解析 + 分析 + 知识库 + LLM 工具调用 + CLI）
-README.md      本文档
-LICENSE        MIT
-```
-
----
-
-## ⚠️ 注意事项
-
-- `MAGMOM` 只是**初猜**，最终磁矩由 VASP 自洽收敛决定；目标是帮助收敛到正确磁基态。
-- 体/表面判别沿用 `mk-KPOINTS` 的“最大周期空隙”算法；极少数原子晶胞的空隙会偏大，
-  可用 `--vacuum-threshold` 调整。
-- 表面金属磁矩增强只是经验性建议（约 +10%~30%），氧化物通常保持价态不变。
-- 写入 INCAR 为**追加**模式；若已有 `ISPIN/MAGMOM`，程序会提示，请先清理旧参数。
-- 非共线磁、SOC、自旋螺旋等需要 `LNONCOLLINEAR/SAXIS`，不在本工具范围内。
-- 内置启发式只是 LLM 不可用时的兜底，精度不如 LLM + 知识库，请优先使用 LLM 模式。
-
----
-
-## 📄 许可
-
-[MIT](LICENSE) © 2026 lyy
+许可证：[MIT](LICENSE)。

@@ -24,9 +24,7 @@ XDATCAR
 vasprun.xml
 *.vasp
 
-# 示例/临时
-examples/
-_ex_tmp/
+# 临时
 _repo_tmp/
 
 # 编辑器 / 系统

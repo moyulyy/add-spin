@@ -5,24 +5,15 @@ add-spin.py —— 一站式 VASP 磁矩初猜工具（POSCAR -> ISPIN / MAGMOM�
 把「按元素拍脑袋给磁矩」升级为「LLM 工具调用 + 晶体学/表面分析」：
 
   * 解析完整 POSCAR（晶格、元素、坐标、Selective dynamics、Cartesian/Direct）；
-  * 判别 bulk / slab / molecule（真空层算法与 mk-KPOINTS 一致）；
+  * 由晶格面法向上的周期空隙估计 bulk / slab / molecule；
   * slab 分层，识别 surface / subsurface / interior 等配位不饱和位点；
   * 识别 fcc/bcc、岩盐、闪锌矿、纤锌矿、钙钛矿、双钙钛矿、尖晶石/反尖晶石、
     LDH、氢氧化物、刚玉、金红石等结构；
   * 内置常见磁性材料知识库，按「元素 + 配位数 + 位点角色」给出磁矩；
-  * 自动分配铁磁 / 亚铁磁 / 反铁磁（fcc 磁层投影、bcc 二部图染色）符号；
+  * 在校验磁性晶胞相容性后，生成共线磁序候选的正负符号；
   * 可选调用任意 OpenAI 兼容 LLM 做 function calling，无 Key 时自动回退启发式。
 
-命令行（--help 查看全部）:
-  python add-spin.py POSCAR                     # 调 LLM，写 INCAR
-  python add-spin.py POSCAR --print             # 只打印
-  python add-spin.py POSCAR --no-llm            # 不联网，内置启发式
-  python add-spin.py POSCAR --hint "...":       # 给 LLM 的补充说明
-  python add-spin.py --self-test                # 运行内置自检
-  python add-spin.py --make-examples DIR        # 导出示例 POSCAR
-
-环境变量: LLM_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY,
-          LLM_BASE_URL / OPENAI_BASE_URL, LLM_MODEL
+LLM 连接及运行配置集中在下方 LLM_* 常量；命令行参数可覆盖。
 
 依赖: Python >= 3.9 + numpy（HTTP 用标准库，无需 openai SDK）。
 """
@@ -40,339 +31,113 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter, deque
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+# ============================================================================
+# 用户配置：LLM（命令行参数 > 环境变量 > 下列默认值）
+# API Key 推荐通过环境变量提供，勿将真实密钥提交到版本库。
+# ============================================================================
+LLM_API_KEY = ""
+LLM_BASE_URL = "https://api.deepseek.com/v1"
+LLM_MODEL = "deepseek-chat"
+LLM_TEMPERATURE = 0.2
+LLM_TIMEOUT = 180
+LLM_MAX_RETRIES = 3  # 单轮请求的最大总尝试次数（含首次请求）
+LLM_MAX_STEPS = 8
+
+
+SYSTEM_PROMPT = """\
+你为 VASP 生成共线自旋初猜 ISPIN/MAGMOM。只输出工具调用，用中文说明依据。
+MAGMOM 是自洽计算初猜，不是磁基态结论；必须比较不同磁序/自旋态的收敛能量。
+
+工作流程：先 analyze_structure，必要时查元素/材料，preview_magmom 校验后再 submit_magmom。
+每条 assignment 必须含 element 与有限 moment。所有原子都必须被规则或 site_overrides 覆盖。
+规则按列表顺序匹配；coordination 严格匹配，不自动猜测低配位表面的体相母位点。
+CN 不能唯一确定几何、氧化态或自旋态；结构名称及按化学式检索的知识库均为候选。
+表面规则应显式给出，并放在元素通用规则之前；不要仅凭低配位就增强磁矩或套用体相结论。
+
+3d 离子弱场自旋种子可取未成对电子数 2S（μB），不是顺磁有效磁矩 sqrt(n(n+2))。
+八面体 d2、d3、d8 不因“低自旋”而变成0；Ni2+ 平方平面与八面体需分别判断。
+按电中性与化学环境推断价态，不能仅按元素判零：Cu2+ 常取1，Cu+ d10通常0；金属Cu通常0。
+Co3+ 八面体可能低自旋0或其他自旋态；Fe2+/Fe3+ 常用4/5。4f应标注自旋与轨道/SOC的区别。
+Fe3O4 的四面体 Fe3+ 与八面体混合价亚晶格反平行；无法区分Fe2+/Fe3+时4.5仅为平均种子。
+稀土A位不一律为0。分子需要电荷/多重度；O2三重态有非零总自旋，不可套用阴离子O2-规则。
+
+magnetic_order:
+- fm：将所有非零磁矩取正。
+- afm：默认在所有非零磁性位点上建立共同周期近邻图；afm_elements 可选择元素/明确组名。
+  只在周期图能二染色时自动赋号，岩盐MnO/FeO/CoO/NiO另检查(111) AFM-II相容性。
+  一个磁性位点的原胞、奇周期或受挫图可能不相容；校验失败不能改称成功AFM。
+  8原子立方NiO惯用胞也不能容纳AFM-II。A/C/G型不能混用；复杂磁序需显式位点方案。
+- ferrimagnetic/auto：保留赋值中的正负号。auto配合site_overrides可指定已知磁序。
+- nonmagnetic：所有位点必须明确为0，ISPIN=1。ISPIN=1不得与非零磁矩并存。
+afm_group只是分组标签，需在afm_elements中选中才触发自动赋号。
+自动AFM不能与site_overrides混用；显式磁序改用auto并完整给出正负磁矩。
+若当前晶胞无法容纳已知目标磁序，必须指出需要磁性超胞，不能通过改成FM掩盖问题。
+仅支持共线磁性，不处理SOC、非共线向量、自旋螺旋、无序局域矩或自动生成超胞。
+所有磁矩单位μB，位点index从0开始，顺序与POSCAR一致。
+"""
 
 
 # ============================================================================
 # 0. 兼容旧版 add-spin.py 的模块级 API
 #    （fast-vasp CLI 会 from add_spin import parse_poscar, build_magmom, append_magmom）
 # ============================================================================
-# 磁性设置字典: 元素 -> 默认初猜磁矩 (未列出的元素默认为 0)
+# 未知化学环境下的开壳层自旋初猜（μB）；不是元素固有磁矩。
+# 未列出的元素默认为 0；具体价态、晶体场和金属环境应由完整分析确定。
 DEFAULT_MAGMOM = {
-    'H': 0, 'He': 0, 'Li': 0, 'Be': 0, 'B': 0, 'C': 0, 'N': 0, 'O': 0,
-    'F': 0, 'Ne': 0, 'Na': 0, 'Mg': 0, 'Al': 0, 'Si': 0, 'P': 0, 'S': 0,
-    'Cl': 0, 'Ar': 0, 'K': 0, 'Ca': 0, 'Sc': 3, 'Ti': 3, 'V': 3, 'Cr': 3,
-    'Mn': 5, 'Fe': 5, 'Co': 5, 'Ni': 5, 'Cu': 3, 'Zn': 0, 'Ga': 0, 'Ge': 0,
-    'As': 0, 'Se': 0, 'Br': 0, 'Kr': 0, 'Rb': 0, 'Sr': 0, 'Y': 3, 'Zr': 3,
-    'Nb': 3, 'Mo': 5, 'Tc': 0, 'Ru': 5, 'Rh': 5, 'Pd': 3, 'Ag': 3, 'Cd': 3,
-    'In': 3, 'Sn': 3, 'Sb': 3, 'Te': 0, 'I': 0, 'Xe': 0, 'Cs': 0, 'Ba': 0,
-    'La': 3, 'Ce': 3, 'Pr': 3, 'Nd': 3, 'Pm': 3, 'Sm': 3, 'Eu': 3, 'Gd': 3,
-    'Tb': 3, 'Dy': 3, 'Ho': 3, 'Er': 3, 'Tm': 3, 'Yb': 3, 'Lu': 3, 'Hf': 3,
-    'Ta': 3, 'W': 3, 'Re': 3, 'Os': 3, 'Ir': 3, 'Pt': 3, 'Au': 3, 'Hg': 3,
-    'Tl': 3, 'Pb': 3, 'Bi': 3, 'Po': 3, 'At': 3, 'Rn': 3, 'Fr': 3, 'Ra': 3,
-    'Ac': 3, 'Th': 3, 'Pa': 3, 'U': 3, 'Np': 3, 'Pu': 3, 'Am': 3, 'Cm': 3
+    'Ti': 1, 'V': 2, 'Cr': 3, 'Mn': 5, 'Fe': 5, 'Co': 3, 'Ni': 2, 'Cu': 1,
+    'Nb': 1, 'Mo': 2, 'Tc': 3, 'Ru': 2, 'Rh': 1,
+    'W': 2, 'Re': 2, 'Os': 2, 'Ir': 1,
+    'Ce': 1, 'Pr': 2, 'Nd': 3, 'Pm': 4, 'Sm': 5, 'Eu': 6, 'Gd': 7,
+    'Tb': 6, 'Dy': 5, 'Ho': 4, 'Er': 3, 'Tm': 2, 'Yb': 1,
+    'Pa': 1, 'U': 2, 'Np': 3, 'Pu': 4, 'Am': 5, 'Cm': 6,
 }
 
 
 def parse_poscar(path="POSCAR"):
-    """解析 POSCAR 第 6/7 行 (元素符号 / 数量), 返回 [(元素, 数量), ...]。
-    解析失败或格式不支持时返回空列表。
-    """
-    with open(path, 'r', encoding='utf-8') as f:
-        lines = f.read().split('\n')
-    if len(lines) < 7:
+    """兼容入口，复用完整解析器避免元素/数量顺序不一致。"""
+    try:
+        pos = parse_poscar_full(path)
+    except ValueError:
         return []
-    elements = re.findall(r'[A-Z][a-z]*', lines[5])
-    counts = list(map(int, re.findall(r'\d+', lines[6])))
-    if not elements or len(elements) != len(counts):
-        return []
-    return list(zip(elements, counts))
+    return list(zip(pos.species, pos.counts))
 
 
 def build_magmom(pairs, custom=None):
-    """生成 'Mag parameter' 文本块 (ISPIN=2 + MAGMOM)。
-    pairs : [(元素, 数量), ...]
-    custom: {元素: 磁矩值}, 未给出的元素使用 DEFAULT_MAGMOM (缺省 0)
-    """
+    """兼容无坐标入口，仅生成元素种子；无法识别位点或 AFM。"""
     custom = custom or {}
-    magmom_values = '   '.join(
-        f"{count}*{custom.get(element, DEFAULT_MAGMOM.get(element, 0))}"
-        for element, count in pairs
-    )
-    elements_str = "   ".join([f"{el:<6}" for el, _ in pairs])
-    counts_str = "   ".join([f"{cnt:<6}" for _, cnt in pairs])
-    magmom_str = "   ".join([f"{x:<6}" for x in magmom_values.split()])
-
-    spin_msg = "Mag parameter\n   ISPIN = 2\n"
-    spin_msg += f"   #Element: {elements_str}\n   #Numbers: {counts_str}\n"
-    spin_msg += "   MAGMOM =  " + magmom_str + "\n"
-    return spin_msg
+    pairs = list(pairs)
+    if not pairs or any(el not in ATOMIC_MASS or type(n) is not int or n < 0 for el, n in pairs):
+        raise ValueError("无效的元素/原子数量")
+    if not sum(n for el, n in pairs):
+        raise ValueError("至少需要一个原子")
+    pure = len({el for el, n in pairs if n}) == 1
+    moments = []
+    for el, count in pairs:
+        default = METAL_MOMENT.get(el, 0.0) if pure else default_element_moment(el)
+        moments.extend([_finite_moment(custom.get(el, default))] * count)
+    pos = Poscar("legacy", np.eye(3), [el for el, n in pairs], [n for el, n in pairs],
+                 [el for el, n in pairs for _ in range(n)], np.zeros((len(moments), 3)), "Direct")
+    return "# 仅按元素的种子：未校验晶体位点、价态或磁序\n" + format_magmom(pos, moments)
 
 
 def append_magmom(path="POSCAR", incar="INCAR", custom=None):
-    """解析 POSCAR 并向 INCAR 追加自旋参数块, 成功返回 True。"""
-    pairs = parse_poscar(path)
-    if not pairs:
-        return False
-    msg = build_magmom(pairs, custom)
-    with open(incar, 'a', encoding='utf-8') as f:
-        f.write("\n" + msg)
+    """兼容入口，使用完整结构分析并安全更新 INCAR。"""
+    pos = parse_poscar_full(path)
+    report = analyze_structure(pos)
+    if custom is None:
+        moments, _ = heuristic_plan(pos, report)
+    else:
+        assignments = [{"element": el, "moment": custom.get(el, default_element_moment(el))}
+                       for el in dict.fromkeys(pos.symbols)]
+        moments = build_moments_from_assignments(pos, report, assignments)
+    append_to_incar(format_magmom(pos, moments), incar)
     return True
-
-# ============================================================================
-# 附录：内置示例结构（--self-test / --make-examples 使用）
-# ============================================================================
-EXAMPLE_POSCARS: Dict[str, str] = {
-    "Pt_fcc": """Pt fcc primitive
-1.0
-    0.0000000000      1.9600000000      1.9600000000
-    1.9600000000      0.0000000000      1.9600000000
-    1.9600000000      1.9600000000      0.0000000000
-Pt
-1
-Direct
-    0.0000000000      0.0000000000      0.0000000000
-""",
-    "Fe_bcc": """Fe bcc primitive
-1.0
-   -1.4350000000      1.4350000000      1.4350000000
-    1.4350000000     -1.4350000000      1.4350000000
-    1.4350000000      1.4350000000     -1.4350000000
-Fe
-1
-Direct
-    0.0000000000      0.0000000000      0.0000000000
-""",
-    "NiO": """NiO rocksalt conventional
-1.0
-    4.1700000000      0.0000000000      0.0000000000
-    0.0000000000      4.1700000000      0.0000000000
-    0.0000000000      0.0000000000      4.1700000000
-Ni  O
-4  4
-Direct
-    0.0000000000      0.0000000000      0.0000000000
-    0.0000000000      0.5000000000      0.5000000000
-    0.5000000000      0.0000000000      0.5000000000
-    0.5000000000      0.5000000000      0.0000000000
-    0.5000000000      0.0000000000      0.0000000000
-    0.5000000000      0.5000000000      0.5000000000
-    1.0000000000      0.0000000000      0.5000000000
-    1.0000000000      0.5000000000      0.0000000000
-""",
-    "NiO_001_slab": """NiO(001) slab 3 layers, vacuum 12 A
-1.0
-    2.9486352775      0.0000000000      0.0000000000
-    1.4743176388      2.5535930569      0.0000000000
-    0.0000000000      0.0000000000     30.0188765563
-Ni  O  Ni  O  Ni  O
-1  1  1  1  1  1
-Direct
-    0.0000000000      0.0000000000      0.3997484708
-    0.6666666667      0.6666666667      0.4398490825
-    0.3333333333      0.3333333333      0.4799496942
-    0.0000000000      0.0000000000      0.5200503058
-    0.6666666667      0.6666666667      0.5601509175
-    0.3333333333      0.3333333333      0.6002515292
-""",
-    "ZnS_zincblende": """ZnS zincblende (a=5.41)
-1.0
-    5.4100000000      0.0000000000      0.0000000000
-    0.0000000000      5.4100000000      0.0000000000
-    0.0000000000      0.0000000000      5.4100000000
-Zn  S
-4  4
-Direct
-    0.0000000000      0.0000000000      0.0000000000
-    0.0000000000      0.5000000000      0.5000000000
-    0.5000000000      0.0000000000      0.5000000000
-    0.5000000000      0.5000000000      0.0000000000
-    0.2500000000      0.2500000000      0.2500000000
-    0.2500000000      0.7500000000      0.7500000000
-    0.7500000000      0.2500000000      0.7500000000
-    0.7500000000      0.7500000000      0.2500000000
-""",
-    "ZnO_wurtzite": """ZnO wurtzite (a=3.25,c=5.21)
-1.0
-    3.2500000000      0.0000000000      0.0000000000
-   -1.6250000000      2.8145825623      0.0000000000
-    0.0000000000      0.0000000000      5.2100000000
-Zn  O
-2  2
-Direct
-    0.3333333333      0.6666666667      0.0000000000
-    0.6666666667      0.3333333333      0.5000000000
-    0.3333333333      0.6666666667      0.3820000000
-    0.6666666667      0.3333333333      0.8820000000
-""",
-    "LaFeO3": """LaFeO3 cubic perovskite (a=3.93)
-1.0
-    3.9300000000      0.0000000000      0.0000000000
-    0.0000000000      3.9300000000      0.0000000000
-    0.0000000000      0.0000000000      3.9300000000
-La  Fe  O
-1  1  3
-Direct
-    0.0000000000      0.0000000000      0.0000000000
-    0.5000000000      0.5000000000      0.5000000000
-    0.5000000000      0.5000000000      0.0000000000
-    0.5000000000      0.0000000000      0.5000000000
-    0.0000000000      0.5000000000      0.5000000000
-""",
-    "NiAl_LDH": """Ni3Al(OH)8 layered double hydroxide monolayer
-1.0
-    6.2600000000      0.0000000000      0.0000000000
-   -3.1300000000      5.4213190277      0.0000000000
-    0.0000000000      0.0000000000     20.0000000000
-Ni  Al  O  H
-3  1  8  8
-Direct
-    0.0000000000      0.0000000000      0.0000000000
-    0.5000000000      0.0000000000      0.0000000000
-    0.0000000000      0.5000000000      0.0000000000
-    0.5000000000      0.5000000000      0.0000000000
-    0.1666666667      0.3333333333      0.0000000000
-    0.3333333333      0.1666666667      0.0000000000
-    0.6666666667      0.3333333333      0.0000000000
-    0.8333333333      0.1666666667      0.0000000000
-    0.1666666667      0.8333333333      0.0000000000
-    0.3333333333      0.6666666667      0.0000000000
-    0.6666666667      0.8333333333      0.0000000000
-    0.8333333333      0.6666666667      0.0000000000
-    0.1666666667      0.3333333333      0.0600000000
-    0.3333333333      0.1666666667      0.0600000000
-    0.6666666667      0.3333333333      0.0600000000
-    0.8333333333      0.1666666667      0.0600000000
-    0.1666666667      0.8333333333      0.0600000000
-    0.3333333333      0.6666666667      0.0600000000
-    0.6666666667      0.8333333333      0.0600000000
-    0.8333333333      0.6666666667      0.0600000000
-""",
-    "Fe3O4": """Fe3O4 inverse spinel (a=8.3967)
-1.0
-    8.3967000000      0.0000000000      0.0000000000
-    0.0000000000      8.3967000000      0.0000000000
-    0.0000000000      0.0000000000      8.3967000000
-Fe  O
-24  32
-Direct
-    0.1250000000      0.1250000000      0.1250000000
-    0.6250000000      0.1250000000      0.6250000000
-    0.1250000000      0.6250000000      0.6250000000
-    0.6250000000      0.6250000000      0.1250000000
-    0.8750000000      0.3750000000      0.3750000000
-    0.8750000000      0.8750000000      0.8750000000
-    0.3750000000      0.3750000000      0.8750000000
-    0.3750000000      0.8750000000      0.3750000000
-    0.5000000000      0.5000000000      0.5000000000
-    0.2500000000      0.7500000000      0.0000000000
-    0.7500000000      0.0000000000      0.2500000000
-    0.0000000000      0.2500000000      0.7500000000
-    0.5000000000      0.0000000000      0.0000000000
-    0.2500000000      0.2500000000      0.5000000000
-    0.7500000000      0.5000000000      0.7500000000
-    0.0000000000      0.7500000000      0.2500000000
-    0.0000000000      0.5000000000      0.0000000000
-    0.7500000000      0.7500000000      0.5000000000
-    0.2500000000      0.0000000000      0.7500000000
-    0.5000000000      0.2500000000      0.2500000000
-    0.0000000000      0.0000000000      0.5000000000
-    0.7500000000      0.2500000000      0.0000000000
-    0.2500000000      0.5000000000      0.2500000000
-    0.5000000000      0.7500000000      0.7500000000
-    0.2549000000      0.2549000000      0.2549000000
-    0.4951000000      0.9951000000      0.7549000000
-    0.9951000000      0.7549000000      0.4951000000
-    0.7549000000      0.4951000000      0.9951000000
-    0.0049000000      0.5049000000      0.2451000000
-    0.7451000000      0.7451000000      0.7451000000
-    0.5049000000      0.2451000000      0.0049000000
-    0.2451000000      0.0049000000      0.5049000000
-    0.2549000000      0.7549000000      0.7549000000
-    0.4951000000      0.4951000000      0.2549000000
-    0.9951000000      0.2549000000      0.9951000000
-    0.7549000000      0.9951000000      0.4951000000
-    0.0049000000      0.0049000000      0.7451000000
-    0.7451000000      0.2451000000      0.2451000000
-    0.5049000000      0.7451000000      0.5049000000
-    0.2451000000      0.5049000000      0.0049000000
-    0.7549000000      0.2549000000      0.7549000000
-    0.9951000000      0.9951000000      0.2549000000
-    0.4951000000      0.7549000000      0.9951000000
-    0.2549000000      0.4951000000      0.4951000000
-    0.5049000000      0.5049000000      0.7451000000
-    0.2451000000      0.7451000000      0.2451000000
-    0.0049000000      0.2451000000      0.5049000000
-    0.7451000000      0.0049000000      0.0049000000
-    0.7549000000      0.7549000000      0.2549000000
-    0.9951000000      0.4951000000      0.7549000000
-    0.4951000000      0.2549000000      0.4951000000
-    0.2549000000      0.9951000000      0.9951000000
-    0.5049000000      0.0049000000      0.2451000000
-    0.2451000000      0.2451000000      0.7451000000
-    0.0049000000      0.7451000000      0.0049000000
-    0.7451000000      0.5049000000      0.5049000000
-""",
-    "MgAl2O4": """MgAl2O4 normal spinel (a=8.08)
-1.0
-    8.0800000000      0.0000000000      0.0000000000
-    0.0000000000      8.0800000000      0.0000000000
-    0.0000000000      0.0000000000      8.0800000000
-Mg  Al  O
-8  16  32
-Direct
-    0.1250000000      0.1250000000      0.1250000000
-    0.6250000000      0.1250000000      0.6250000000
-    0.1250000000      0.6250000000      0.6250000000
-    0.6250000000      0.6250000000      0.1250000000
-    0.8750000000      0.3750000000      0.3750000000
-    0.8750000000      0.8750000000      0.8750000000
-    0.3750000000      0.3750000000      0.8750000000
-    0.3750000000      0.8750000000      0.3750000000
-    0.5000000000      0.5000000000      0.5000000000
-    0.2500000000      0.7500000000      0.0000000000
-    0.7500000000      0.0000000000      0.2500000000
-    0.0000000000      0.2500000000      0.7500000000
-    0.5000000000      0.0000000000      0.0000000000
-    0.2500000000      0.2500000000      0.5000000000
-    0.7500000000      0.5000000000      0.7500000000
-    0.0000000000      0.7500000000      0.2500000000
-    0.0000000000      0.5000000000      0.0000000000
-    0.7500000000      0.7500000000      0.5000000000
-    0.2500000000      0.0000000000      0.7500000000
-    0.5000000000      0.2500000000      0.2500000000
-    0.0000000000      0.0000000000      0.5000000000
-    0.7500000000      0.2500000000      0.0000000000
-    0.2500000000      0.5000000000      0.2500000000
-    0.5000000000      0.7500000000      0.7500000000
-    0.2549000000      0.2549000000      0.2549000000
-    0.4951000000      0.9951000000      0.7549000000
-    0.9951000000      0.7549000000      0.4951000000
-    0.7549000000      0.4951000000      0.9951000000
-    0.0049000000      0.5049000000      0.2451000000
-    0.7451000000      0.7451000000      0.7451000000
-    0.5049000000      0.2451000000      0.0049000000
-    0.2451000000      0.0049000000      0.5049000000
-    0.2549000000      0.7549000000      0.7549000000
-    0.4951000000      0.4951000000      0.2549000000
-    0.9951000000      0.2549000000      0.9951000000
-    0.7549000000      0.9951000000      0.4951000000
-    0.0049000000      0.0049000000      0.7451000000
-    0.7451000000      0.2451000000      0.2451000000
-    0.5049000000      0.7451000000      0.5049000000
-    0.2451000000      0.5049000000      0.0049000000
-    0.7549000000      0.2549000000      0.7549000000
-    0.9951000000      0.9951000000      0.2549000000
-    0.4951000000      0.7549000000      0.9951000000
-    0.2549000000      0.4951000000      0.4951000000
-    0.5049000000      0.5049000000      0.7451000000
-    0.2451000000      0.7451000000      0.2451000000
-    0.0049000000      0.2451000000      0.5049000000
-    0.7451000000      0.0049000000      0.0049000000
-    0.7549000000      0.7549000000      0.2549000000
-    0.9951000000      0.4951000000      0.7549000000
-    0.4951000000      0.2549000000      0.4951000000
-    0.2549000000      0.9951000000      0.9951000000
-    0.5049000000      0.0049000000      0.2451000000
-    0.2451000000      0.2451000000      0.7451000000
-    0.0049000000      0.7451000000      0.0049000000
-    0.7451000000      0.5049000000      0.5049000000
-""",
-}
-
 
 # ============================================================================
 # 1. 元素基础数据
@@ -428,36 +193,52 @@ RCOV = {
 
 # 常见氧化态（用于给出价态 / d 电子数提示）
 COMMON_OXIDATION = {
-    "Sc": [3], "Ti": [2, 3, 4], "V": [2, 3, 4, 5], "Cr": [2, 3, 6],
-    "Mn": [2, 3, 4, 6, 7], "Fe": [2, 3], "Co": [2, 3], "Ni": [2, 3],
+    "Sc": [3], "Ti": [2, 3, 4], "V": [2, 3, 4, 5], "Cr": [2, 3, 4, 6],
+    "Mn": [2, 3, 4, 6, 7], "Fe": [2, 3, 4], "Co": [2, 3, 4], "Ni": [2, 3],
     "Cu": [1, 2], "Zn": [2], "Y": [3], "Zr": [4], "Nb": [3, 5],
-    "Mo": [3, 4, 6], "Ru": [3, 4], "Rh": [3], "Pd": [2, 4], "Ag": [1],
-    "Ce": [3, 4], "Pr": [3], "Nd": [3], "Sm": [2, 3], "Eu": [2, 3],
+    "Mo": [3, 4, 5, 6], "Ru": [3, 4], "Rh": [3], "Pd": [2, 4], "Ag": [1],
+    "Ce": [3, 4], "Pr": [3], "Nd": [3], "Pm": [3], "Sm": [2, 3], "Eu": [2, 3],
     "Gd": [3], "Tb": [3], "Dy": [3], "Ho": [3], "Er": [3], "Tm": [3],
-    "Yb": [2, 3], "Lu": [3], "Hf": [4], "Ta": [5], "W": [4, 6],
-    "Re": [4, 7], "Os": [4], "Ir": [3, 4], "Pt": [2, 4], "U": [4, 6],
+    "Yb": [2, 3], "Lu": [3], "Hf": [4], "Ta": [5], "W": [4, 5, 6],
+    "Re": [4, 5, 6, 7], "Os": [4], "Ir": [3, 4], "Pt": [2, 4], "U": [4, 6],
 }
 
-# 3d/4d/5d/4f 磁性离子：ox -> (d/f 电子数, 高自旋未成对电子数, 低自旋未成对电子数)
+# 离子：ox -> (d/f 电子数, 高自旋未成对电子数, 低自旋未成对电子数)。
+# d 壳层 HS/LS 均指理想八面体晶体场；d1-d3、d8-d10 的两列相同。
+# 四面体、平方平面等环境须另行判断（例如平方平面 d8 可为 S=0）。
+# f 壳层两列给 Hund 自旋计数，不代表含 SOC 的总磁矩或实验有效磁矩。
 MAGNETIC_IONS = {
-    "Ti": {2: (2, 2, 0), 3: (1, 1, 1)},
-    "V":  {2: (3, 3, 1), 3: (2, 2, 0), 4: (1, 1, 1)},
-    "Cr": {2: (4, 4, 2), 3: (3, 3, 3)},
-    "Mn": {2: (5, 5, 1), 3: (4, 4, 0), 4: (3, 3, 1)},
-    "Fe": {2: (6, 4, 0), 3: (5, 5, 1)},
+    "Sc": {3: (0, 0, 0)},
+    "Ti": {2: (2, 2, 2), 3: (1, 1, 1), 4: (0, 0, 0)},
+    "V":  {2: (3, 3, 3), 3: (2, 2, 2), 4: (1, 1, 1), 5: (0, 0, 0)},
+    "Cr": {2: (4, 4, 2), 3: (3, 3, 3), 4: (2, 2, 2), 6: (0, 0, 0)},
+    "Mn": {2: (5, 5, 1), 3: (4, 4, 2), 4: (3, 3, 3), 6: (1, 1, 1), 7: (0, 0, 0)},
+    "Fe": {2: (6, 4, 0), 3: (5, 5, 1), 4: (4, 4, 2)},
     "Co": {2: (7, 3, 1), 3: (6, 4, 0), 4: (5, 5, 1)},
-    "Ni": {2: (8, 2, 0), 3: (7, 3, 1)},
-    "Cu": {2: (9, 1, 1)},
-    "Ru": {3: (5, 3, 1), 4: (4, 2, 0)},
+    "Ni": {2: (8, 2, 2), 3: (7, 3, 1)},
+    "Cu": {1: (10, 0, 0), 2: (9, 1, 1)},
+    "Zn": {2: (10, 0, 0)},
+    "Y": {3: (0, 0, 0)},
+    "Zr": {4: (0, 0, 0)},
+    "Nb": {3: (2, 2, 2), 5: (0, 0, 0)},
+    "Ru": {3: (5, 5, 1), 4: (4, 4, 2)},
     "Rh": {3: (6, 4, 0)},
-    "Mo": {3: (3, 3, 3), 4: (2, 2, 0)},
-    "W":  {4: (2, 2, 0), 5: (1, 1, 1)},
-    "Re": {4: (3, 3, 1), 6: (1, 1, 1)},
-    "Ir": {4: (5, 3, 1)},
-    "Ce": {3: (1, 1, 1)},
+    "Pd": {2: (8, 2, 2), 4: (6, 4, 0)},
+    "Ag": {1: (10, 0, 0)},
+    "Mo": {3: (3, 3, 3), 4: (2, 2, 2), 5: (1, 1, 1), 6: (0, 0, 0)},
+    "Hf": {4: (0, 0, 0)},
+    "Ta": {5: (0, 0, 0)},
+    "W":  {4: (2, 2, 2), 5: (1, 1, 1), 6: (0, 0, 0)},
+    "Re": {4: (3, 3, 3), 5: (2, 2, 2), 6: (1, 1, 1), 7: (0, 0, 0)},
+    "Os": {4: (4, 4, 2)},
+    "Ir": {3: (6, 4, 0), 4: (5, 5, 1)},
+    "Pt": {2: (8, 2, 2), 4: (6, 4, 0)},
+    "La": {3: (0, 0, 0)},
+    "Ce": {3: (1, 1, 1), 4: (0, 0, 0)},
     "Pr": {3: (2, 2, 2)},
     "Nd": {3: (3, 3, 3)},
-    "Sm": {3: (5, 5, 5)},
+    "Pm": {3: (4, 4, 4)},
+    "Sm": {2: (6, 6, 6), 3: (5, 5, 5)},
     "Eu": {2: (7, 7, 7), 3: (6, 6, 6)},
     "Gd": {3: (7, 7, 7)},
     "Tb": {3: (8, 6, 6)},
@@ -465,7 +246,8 @@ MAGNETIC_IONS = {
     "Ho": {3: (10, 4, 4)},
     "Er": {3: (11, 3, 3)},
     "Tm": {3: (12, 2, 2)},
-    "Yb": {3: (13, 1, 1)},
+    "Yb": {2: (14, 0, 0), 3: (13, 1, 1)},
+    "Lu": {3: (14, 0, 0)},
 }
 
 # 纯金属铁磁/反铁磁参考磁矩 (μB/atom)，用于简单金属体系
@@ -474,17 +256,18 @@ METAL_MOMENT = {
     "Mn": 1.0, "Cr": 1.0, "Gd": 7.0, "Tb": 6.0, "Dy": 5.0, "Ho": 4.0,
     "Er": 3.0,
 }
-# 常见非磁性（d0/d10/闭壳层）元素，避免给它们乱加磁矩
+# 常见闭壳层化合物的零磁矩兜底；不适用于孤立原子、自由基、缺陷态。
+# Cu2+ 为 d9，不能因金属 Cu 非磁就将所有含 Cu 化合物判为非磁。
 NONMAGNETIC = set(
     "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca "
     "Ga Ge As Se Br Kr Rb Sr In Sn Sb Te I Xe Cs Ba "
-    "Zn Cd Hg Pb Bi Ag Cu Au".split()
+    "Sc Y La Lu Zn Cd Hg Pb Bi Ag Au".split()
 )
-# 氧化物中常见高自旋磁矩（按元素，未知价态时的稳妥初猜）
+# 氧化物中未知价态时的经验自旋初猜；4d/5d 常取较小值，不代表确定自旋态。
 OXIDE_HS = {
     "Ti": 1, "V": 2, "Cr": 3, "Mn": 5, "Fe": 5, "Co": 3, "Ni": 2, "Cu": 1,
-    "Ru": 3, "Rh": 2, "Mo": 2, "W": 2, "Re": 2, "Ir": 2,
-    "Ce": 1, "Pr": 2, "Nd": 3, "Sm": 5, "Eu": 6, "Gd": 7, "Tb": 6,
+    "Ru": 2, "Rh": 1, "Mo": 2, "W": 2, "Re": 2, "Ir": 1,
+    "Ce": 1, "Pr": 2, "Nd": 3, "Pm": 4, "Sm": 5, "Eu": 6, "Gd": 7, "Tb": 6,
     "Dy": 5, "Ho": 4, "Er": 3, "Tm": 2, "Yb": 1,
 }
 
@@ -508,12 +291,12 @@ def cov_radius(symbol: str) -> float:
 
 
 def default_element_moment(symbol: str) -> float:
-    """单一元素、未知环境的兜底磁矩。"""
+    """未知化学环境的自旋初猜；不能用于推断价态或磁基态。"""
     if symbol in NONMAGNETIC:
         return 0.0
     if symbol in OXIDE_HS:
         return float(OXIDE_HS[symbol])
-    return float(LEGACY_DEFAULT_MAGMOM.get(symbol, 0.0))
+    return float(DEFAULT_MAGMOM.get(symbol, 0.0))
 
 
 # ============================================================================
@@ -615,14 +398,21 @@ def parse_poscar_text(text: str, source: str = "POSCAR") -> Poscar:
         raise ValueError("POSCAR 行数不足，无法解析")
 
     comment = lines[0].strip()
-    scale_tokens = lines[1].split()
+    scale_tokens = re.split(r"[!#]", lines[1], maxsplit=1)[0].split()
+    if len(scale_tokens) not in (1, 3):
+        raise ValueError("POSCAR 缩放行必须包含 1 个或 3 个数值")
+    scales = np.array([float(x) for x in scale_tokens], dtype=float)
+    if not np.all(np.isfinite(scales)) or np.any(scales == 0):
+        raise ValueError("POSCAR 缩放因子必须有限且非零")
 
     # ---- 缩放因子 -----------------------------------------------------
     coord_scale: np.ndarray | float
     scale_vec: Optional[np.ndarray] = None
     volume_target: Optional[float] = None
     if len(scale_tokens) == 3:
-        scale_vec = np.array([float(x) for x in scale_tokens])
+        scale_vec = scales
+        if np.any(scale_vec <= 0):
+            raise ValueError("POSCAR 的三个缩放因子必须全部为正")
         coord_scale = scale_vec
     else:
         s = float(scale_tokens[0])
@@ -635,29 +425,47 @@ def parse_poscar_text(text: str, source: str = "POSCAR") -> Poscar:
     raw_lattice = np.array(
         [[float(x) for x in lines[2 + i].split()[:3]] for i in range(3)]
     )
+    if raw_lattice.shape != (3, 3) or not np.all(np.isfinite(raw_lattice)):
+        raise ValueError("POSCAR 晶格必须为有限的 3×3 矩阵")
+    raw_vol = abs(float(np.linalg.det(raw_lattice)))
+    if raw_vol <= 1e-12:
+        raise ValueError("POSCAR 晶格矩阵不可逆或体积过小")
     if volume_target is not None:
-        raw_vol = abs(np.linalg.det(raw_lattice))
-        factor = (volume_target / raw_vol) ** (1.0 / 3.0) if raw_vol > 0 else 1.0
+        factor = (volume_target / raw_vol) ** (1.0 / 3.0)
         lattice = raw_lattice * factor
         coord_scale = factor
     elif scale_vec is not None:
-        lattice = raw_lattice * scale_vec[:, None]
+        # VASP 三因子分别缩放 Cartesian x/y/z 分量，即晶格矩阵的列。
+        lattice = raw_lattice * scale_vec[None, :]
     else:
         lattice = raw_lattice * float(coord_scale)
 
     # ---- 元素 / 数量 --------------------------------------------------
     idx = 5
-    tok5 = lines[idx].split()
+    tok5 = re.split(r"[!#]", lines[idx], maxsplit=1)[0].split()
+    if not tok5:
+        raise ValueError("POSCAR 元素/数量行为空")
     source_species: Optional[List[str]] = None
     if tok5 and all(_is_int(t) for t in tok5):
         # VASP4：没有元素符号行
         counts = [int(t) for t in tok5]
         idx += 1
     else:
-        source_species = [re.sub(r"[^A-Za-z]", "", t) for t in tok5]
+        source_species = []
+        for token in tok5:
+            # 保留标准符号；允许 Fe_pv 等常见 POTCAR 标签。
+            symbol = token.split("_", 1)[0]
+            if symbol not in _SYMBOLS:
+                raise ValueError(f"POSCAR 无法识别元素符号: {token}")
+            source_species.append(symbol)
         idx += 1
-        counts = [int(t) for t in lines[idx].split()[: len(source_species)]]
+        count_tokens = re.split(r"[!#]", lines[idx], maxsplit=1)[0].split()
+        if len(count_tokens) != len(source_species):
+            raise ValueError("POSCAR 元素种类数与数量条目数不一致")
+        counts = [int(t) for t in count_tokens]
         idx += 1
+    if not counts or any(c < 0 for c in counts) or sum(counts) <= 0:
+        raise ValueError("POSCAR 原子数量必须为非负整数，且总原子数必须大于零")
 
     # ---- Selective dynamics ------------------------------------------
     selective = None
@@ -670,7 +478,9 @@ def parse_poscar_text(text: str, source: str = "POSCAR") -> Poscar:
     mode = lines[idx].strip()
     if not mode:
         raise ValueError("POSCAR 坐标模式行为空")
-    coord_mode = "Direct" if mode[0] in ("D", "d") else "Cartesian"
+    if mode[0] not in "DdCcKk":
+        raise ValueError(f"POSCAR 未知坐标模式: {mode}")
+    coord_mode = "Cartesian" if mode[0] in "CcKk" else "Direct"
     idx += 1
 
     n_atoms = sum(counts)
@@ -679,11 +489,13 @@ def parse_poscar_text(text: str, source: str = "POSCAR") -> Poscar:
         if idx + k >= len(lines):
             raise ValueError(f"POSCAR 坐标行不足，期望 {n_atoms} 个原子")
         parts = lines[idx + k].split()
+        if len(parts) < 3:
+            raise ValueError(f"POSCAR 第 {k + 1} 个原子坐标不足三个分量")
         coords.append([float(parts[0]), float(parts[1]), float(parts[2])])
         if selective is not None:
+            if len(parts) < 6 or any(p[:1] not in "TtFf" for p in parts[3:6]):
+                raise ValueError(f"POSCAR 第 {k + 1} 个原子缺少有效的三个 T/F 约束标记")
             flags = [p[:1] in ("T", "t") for p in parts[3:6]]
-            while len(flags) < 3:
-                flags.append(True)
             selective.append(flags)
     idx += n_atoms
 
@@ -706,13 +518,17 @@ def parse_poscar_text(text: str, source: str = "POSCAR") -> Poscar:
             os.path.join(os.path.dirname(os.path.abspath(source)) or ".", "POTCAR")
         )
         if not source_species or len(source_species) != len(counts):
-            source_species = [f"X{i + 1}" for i in range(len(counts))]
+            raise ValueError("VASP4 POSCAR 缺少元素符号，需在同目录提供匹配的 POTCAR")
+        if any(s not in _SYMBOLS for s in source_species):
+            raise ValueError("POTCAR 包含无法识别的元素符号")
 
     symbols: List[str] = []
     for el, cnt in zip(source_species, counts):
         symbols.extend([el] * cnt)
 
     arr = np.array(coords, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("POSCAR 原子坐标必须为有限数值")
     if coord_mode == "Cartesian":
         if isinstance(coord_scale, np.ndarray):
             cart = arr * coord_scale
@@ -773,7 +589,9 @@ def min_image_distances(
 ) -> np.ndarray:
     """计算满足 cutoff 的原子对最小镜像距离，返回 (M,3) 的 [i, j, dist]。"""
     idx = list(range(pos.n_atoms)) if indices is None else list(indices)
-    cart = pos.cartesian()
+    # 平移任一原子整数个晶格矢量不能改变近邻；先折回主晶胞，
+    # 才能使用围绕原点构造的有限周期镜像集合。
+    cart = (pos.frac % 1.0) @ pos.lattice
     offsets = _image_offsets(pos.lattice, cutoff)
     pairs = []
     for a in range(len(idx)):
@@ -807,9 +625,13 @@ def coordination_analysis(
     再用"距离间隙"截断到第一配位壳层。这样在离子化合物中不会被
     阳离子-阳离子长接触（如 Mg-Mg 3.5 Å）污染，得到正确的四面体/八面体配位。
     """
+    if not np.isfinite(factor) or factor <= 0:
+        raise ValueError("配位截断因子必须为正的有限数值")
+    if pos.n_atoms == 0:
+        return []
     radii = np.array([cov_radius(s) for s in pos.symbols])
     max_cut = factor * float(radii.max()) * 2.0 + 0.5
-    cart = pos.cartesian()
+    cart = (pos.frac % 1.0) @ pos.lattice
     offsets = _image_offsets(pos.lattice, max_cut)
     offset_norms = np.linalg.norm(offsets, axis=1)
     cand: List[List[Tuple[int, float]]] = [[] for _ in pos.symbols]
@@ -824,31 +646,36 @@ def coordination_analysis(
                     cand[i].append((i, float(d)))
             else:
                 # 小晶胞中同一原子的多个周期镜像都可能是真实近邻，全部计入
+                if np.any(dists < 1e-6):
+                    raise ValueError(f"原子 {i} 与 {j} 在周期边界条件下重合")
                 for d in dists[dists <= cut]:
                     cand[i].append((j, float(d)))
                     cand[j].append((i, float(d)))
 
     neigh: List[List[Tuple[int, float]]] = []
+    nonmetals = set("H He B C N O F Ne Si P S Cl Ar Ge As Se Br Kr Sb Te I Xe At Rn".split())
+    pure_metal = len(set(pos.symbols)) == 1 and pos.symbols[0] not in nonmetals
     for i in range(n):
         lst = sorted(cand[i], key=lambda t: t[1])
-        cn = _first_shell_count([d for _, d in lst])
+        # bcc 的第二壳层仅比第一壳层远 15.5%，不能沿用离子配位容差。
+        cn = _first_shell_count([d for _, d in lst], ratio=1.10 if pure_metal else 1.25)
         neigh.append(lst[:cn])
     return neigh
 
 
 def geometry_label(cn: int) -> str:
     return {
-        2: "linear (2)",
-        3: "trigonal-planar (3)",
-        4: "tetrahedral (4)",
-        5: "trigonal-bipyramidal (5)",
-        6: "octahedral (6)",
+        2: "2-coordinate (geometry unverified)",
+        3: "3-coordinate (geometry unverified)",
+        4: "4-coordinate (tetrahedral/square-planar candidates)",
+        5: "5-coordinate (geometry unverified)",
+        6: "6-coordinate (octahedral candidate)",
         7: "7-coordinate",
-        8: "cubic/8-coordinate",
+        8: "8-coordinate (geometry unverified)",
         9: "9-coordinate",
         10: "10-coordinate",
         11: "11-coordinate",
-        12: "cuboctahedral/fcc (12)",
+        12: "12-coordinate (fcc/hcp candidates)",
     }.get(cn, f"{cn}-coordinate")
 
 
@@ -857,7 +684,7 @@ def geometry_label(cn: int) -> str:
 # ============================================================================
 # ============================================================================
 # 3.5 体系类型 (bulk / slab / mole) 与表面层的数学分析
-#     判别算法与 mk-KPOINTS 项目一致：一维分数坐标的最大周期空隙 × 晶格长度，
+#     一维分数坐标的最大周期空隙 × 对应晶格面的法向间距，
 #     空隙 > 阈值 (默认 5 Å) 即认为该方向存在真空。
 # ============================================================================
 DEFAULT_VACUUM_THRESHOLD = 5.0
@@ -876,10 +703,14 @@ def largest_periodic_gap(frac_values: Sequence[float]) -> float:
 
 
 def vacuum_gaps(pos: Poscar) -> Dict[str, float]:
-    """返回 a/b/c 三个方向的真空层厚度 (Å)。"""
-    lengths = np.linalg.norm(pos.lattice, axis=1)
+    """返回各晶格面对的最大空隙 (Å)，作为真空厚度的几何估计。
+
+    分数坐标 f_i 的法向为逆晶格矩阵第 i 列；斜晶胞不能用晶格矢量
+    长度替代面间距。该判据不包含原子半径，不能单独证明体系维度。
+    """
+    heights = 1.0 / np.linalg.norm(np.linalg.inv(pos.lattice), axis=0)
     return {
-        ax: largest_periodic_gap(pos.frac[:, i]) * float(lengths[i])
+        ax: largest_periodic_gap(pos.frac[:, i]) * float(heights[i])
         for i, ax in enumerate("abc")
     }
 
@@ -889,13 +720,19 @@ def detect_system_type(
     vacuum_threshold: float = DEFAULT_VACUUM_THRESHOLD,
     gaps: Optional[Dict[str, float]] = None,
 ) -> Tuple[str, Dict[str, float]]:
-    """按真空层判别 bulk / slab / mole / unknown（与 mk-KPOINTS 一致）。"""
+    """按真空空隙估计 bulk / slab / mole / unknown。
+
+    任一单方向有真空均可为 slab；两个方向有真空可能是线状体系，
+    暂以 unknown 标记。
+    """
+    if not np.isfinite(vacuum_threshold) or vacuum_threshold <= 0:
+        raise ValueError("真空阈值必须为正的有限数值")
     if gaps is None:
         gaps = vacuum_gaps(pos)
     has = {a: gaps[a] > vacuum_threshold + 1e-8 for a in gaps}
     if has["a"] and has["b"] and has["c"]:
         return "mole", gaps
-    if (not has["a"]) and (not has["b"]) and has["c"]:
+    if sum(has.values()) == 1:
         return "slab", gaps
     if (not has["a"]) and (not has["b"]) and (not has["c"]):
         return "bulk", gaps
@@ -914,12 +751,16 @@ def slab_layer_analysis(
 ) -> Dict:
     """把 slab 沿真空法向分层，识别上下表面 / 次表面 / 内部，并给出层间距。
 
-    - 真空方向由最大 vacuum gap 决定（与 mk-KPOINTS 判别一致）；
+    - 真空方向由最大 vacuum gap 决定；
     - 层位置 = 原子笛卡尔坐标在“真空轴法向”上的投影；
     - 把最大空隙平移到边界，于是 t<0 一侧是下表面、t>0 一侧是上表面。
     """
     if gaps is None:
         gaps = vacuum_gaps(pos)
+    if not np.isfinite(layer_tol) or layer_tol <= 0:
+        raise ValueError("分层容差必须为正的有限数值")
+    if pos.n_atoms == 0:
+        raise ValueError("空结构无法分层")
     axis = _vacuum_axis_index(gaps)
     lattice = pos.lattice
     other = [x for x in range(3) if x != axis]
@@ -929,6 +770,8 @@ def slab_layer_analysis(
         normal = lattice[axis] / (np.linalg.norm(lattice[axis]) + 1e-12)
     else:
         normal = normal / nrm
+    if np.dot(lattice[axis], normal) < 0:
+        normal = -normal
     cart = pos.cartesian()
     t = cart @ normal
     period = abs(float(np.dot(lattice[axis], normal)))
@@ -938,7 +781,7 @@ def slab_layer_analysis(
 
     n = len(t)
     if n <= 1:
-        t_shift = t.copy()
+        t_shift = np.zeros_like(t)
     else:
         order = np.argsort(t)
         ts = t[order]
@@ -955,14 +798,13 @@ def slab_layer_analysis(
 
     # 一维聚类成“原子层”
     order2 = np.argsort(t_shift)
-    sts = t_shift[order2]
     layers = np.zeros(n, dtype=int)
     lvl = 0
-    ref = sts[0]
+    ref = t_shift[order2[0]]
     for i in order2[1:]:
-        if sts[i] - ref > layer_tol:
+        if t_shift[i] - ref > layer_tol:
             lvl += 1
-            ref = sts[i]
+            ref = t_shift[i]
         layers[i] = lvl
     n_layers = lvl + 1
     layer_positions = [
@@ -1096,7 +938,7 @@ def _lattice_kind(pos: Poscar) -> str:
 def detect_motif(
     pos: Poscar, neigh: List[List[Tuple[int, float]]], system_type: str = "bulk"
 ) -> Dict:
-    """基于化学计量、最大配位数与晶格形状识别常见结构基元。
+    """基于化学计量、配位数与局部键角提出结构基元候选。
 
     使用"最大配位数"而非瞬时配位数，以兼容 slab 上下表面配位不饱和的情况
     （表面 4 配位原子降到 3、八面体 6 配位降到 5 等，内部原子仍保留 bulk 配位）。
@@ -1104,6 +946,29 @@ def detect_motif(
     comp = pos.composition()
     cn_list = [len(x) for x in neigh]
     elements = set(comp)
+    nonmetals = set("H He B C N O F Ne Si P S Cl Ar Ge As Se Br Kr Sb Te I Xe At Rn".split())
+
+    def has_site_geometry(i: int, geometry: str) -> bool:
+        """按周期近邻键角区分四面体/八面体，避免仅以 CN 推断。"""
+        expected = 4 if geometry == "tetrahedral" else 6
+        if len(neigh[i]) != expected:
+            return False
+        cutoff = max(d for _, d in neigh[i]) + 1e-5
+        offsets = _image_offsets(pos.lattice, cutoff)
+        cart = (pos.frac % 1.0) @ pos.lattice
+        vectors = []
+        for j in {j for j, _ in neigh[i]}:
+            diff = cart[j] - cart[i] + offsets
+            lengths = np.linalg.norm(diff, axis=1)
+            for vector, length in zip(diff, lengths):
+                if 1e-6 < length <= cutoff:
+                    vectors.append(vector / length)
+        if len(vectors) != expected:
+            return False
+        dots = np.array([np.dot(vectors[a], vectors[b])
+                         for a in range(expected) for b in range(a + 1, expected)])
+        target = np.full(6, -1.0 / 3.0) if expected == 4 else np.array([-1.0] * 3 + [0.0] * 12)
+        return bool(np.allclose(np.sort(dots), target, atol=0.20, rtol=0.0))
 
     cn_by_element: Dict[str, Counter] = {}
     max_cn: Dict[str, int] = {}
@@ -1123,11 +988,13 @@ def detect_motif(
     }
     if system_type == "slab":
         motif["notes"].append(
-            "这是由体相切出的 slab，上下表面存在配位不饱和位点；"
-            "MAGMOM 需要区分 bulk 内部位点与 surface/次表面位点。"
+            "真空空隙判据提示 slab；表面可能配位不饱和，"
+            "不能仅按表面 CN 推断对应体相晶格或阳离子价态。"
         )
     elif system_type == "mole":
-        motif["notes"].append("这是分子/团簇体系，所有原子都可视为配位不饱和。")
+        motif.update(family="molecule", name=f"分子/团簇候选 {pos.formula()}")
+        motif["notes"].append("存在三个方向的大空隙；不套用体相金属或晶体结构类型。")
+        return motif
 
     # ---- 单元素金属 ---------------------------------------------------
     if len(elements) == 1:
@@ -1137,15 +1004,16 @@ def detect_motif(
         sub = "unknown"
         if cn == 12:
             sub = "hcp" if kind == "hexagonal" else "fcc"
-        elif cn >= 13:
-            sub = "bcc"
         elif cn == 8:
             sub = "bcc"
         elif cn == 6:
             sub = "simple-cubic"
         elif cn == 4:
             sub = "diamond-like"
-        motif.update(family="metal", name=f"{el} 金属 ({sub})", lattice=kind, metal_lattice=sub)
+        if el in nonmetals:
+            motif.update(family="elemental", name=f"{el} 单质（局部 {sub} 候选）", lattice=kind)
+        else:
+            motif.update(family="metal", name=f"{el} 金属 ({sub} 候选)", lattice=kind, metal_lattice=sub)
         return motif
 
     # ---- 含阴离子/羟基的化合物 ----------------------------------------
@@ -1166,7 +1034,7 @@ def detect_motif(
             if len(metals) >= 2 and oct_metals:
                 motif.update(
                     family="ldh",
-                    name=f"层状双金属氢氧化物 LDH {pos.formula()}",
+                    name=f"层状双金属氢氧化物 LDH 候选 {pos.formula()}",
                     metals=sorted(metals),
                     notes=[
                         "主体为八面体 M(OH)6 共边形成的类水镁石层，层间为阴离子/水；",
@@ -1178,7 +1046,7 @@ def detect_motif(
             if len(metals) == 1 and max_cn.get(metals[0], 0) >= 6:
                 motif.update(
                     family="hydroxide",
-                    name=f"氢氧化物 {pos.formula()} (brucite-like)",
+                    name=f"氢氧化物候选 {pos.formula()} (brucite-like)",
                     metals=sorted(metals),
                     notes=["八面体 M(OH)6 层板；H 置 0。"],
                 )
@@ -1187,11 +1055,11 @@ def detect_motif(
         # ---- 双钙钛矿 A2 B B' O6 ------------------------------------
         if norm.get(anion) == 6 and len(cation_elements) >= 3:
             counts = sorted(norm[el] for el in cation_elements)
-            if counts == [1, 1, 2]:
+            if counts == [1, 1, 2] and len(oct_els) >= 2:
                 b_sites = [el for el in cation_elements if max_cn.get(el, 0) == 6]
                 motif.update(
                     family="double_perovskite",
-                    name=f"双钙钛矿型 {pos.formula()}",
+                    name=f"双钙钛矿候选 {pos.formula()}",
                     b_sites=b_sites,
                     notes=[
                         "B/B' 位为八面体过渡金属，通常反平行排列（铁磁/亚铁磁）；",
@@ -1201,17 +1069,20 @@ def detect_motif(
                 return motif
 
         # ---- 尖晶石 A B2 O4（含 Fe3O4 / Co3O4 这类二元 3:4）-----------
-        if norm.get(anion) == 4 and n_cations == 3:
+        if (norm.get(anion) == 4 and n_cations == 3 and system_type == "bulk"
+                and tet_els and oct_els
+                and any(has_site_geometry(i, "tetrahedral") for i, el in enumerate(pos.symbols) if el in tet_els)
+                and any(has_site_geometry(i, "octahedral") for i, el in enumerate(pos.symbols) if el in oct_els)):
             if len(cation_elements) == 1:
                 el = cation_elements[0]
                 if 4 in site_cn[el] and 6 in site_cn[el]:
-                    stype = "inverse/mixed（同一元素同时占 8a 与 16d）"
+                    stype = "未定（同一元素同时占四/六配位，需价态区分正/反尖晶石）"
                 elif 6 in site_cn[el]:
                     stype = "全部八面体（非典型尖晶石）"
                 else:
                     stype = "未定"
                 motif.update(
-                    family="spinel", name=f"尖晶石型 {pos.formula()}",
+                    family="spinel", name=f"尖晶石候选 {pos.formula()}",
                     spinel_type=stype, tetrahedral_site=el, octahedral_site=el,
                 )
             else:
@@ -1219,11 +1090,11 @@ def detect_motif(
                 two = [el for el in cation_elements if norm[el] == 2]
                 tet = tet_els[0] if tet_els else None
                 if one and two and tet == one[0]:
-                    stype, name = "normal", f"正尖晶石 {pos.formula()}"
+                    stype, name = "normal", f"正尖晶石候选 {pos.formula()}"
                 elif two and tet == two[0]:
-                    stype, name = "inverse", f"反尖晶石 {pos.formula()}"
+                    stype, name = "inverse", f"反尖晶石候选 {pos.formula()}"
                 else:
-                    stype, name = "mixed/undetermined", f"尖晶石型 {pos.formula()}"
+                    stype, name = "mixed/undetermined", f"尖晶石候选 {pos.formula()}"
                 motif.update(
                     family="spinel", name=name, spinel_type=stype,
                     tetrahedral_site=tet, octahedral_site=oct_els[0] if oct_els else None,
@@ -1235,14 +1106,17 @@ def detect_motif(
             return motif
 
         # ---- 钙钛矿 A B O3 ------------------------------------------
-        if norm.get(anion) == 3 and n_cations == 2:
+        if (norm.get(anion) == 3 and n_cations == 2 and len(cation_elements) == 2
+                and all(norm[el] == 1 for el in cation_elements)
+                and any(max_cn.get(el, 0) >= 8 for el in cation_elements)
+                and any(max_cn.get(el, 0) == 6 for el in cation_elements)):
             a_site = [el for el in cation_elements if max_cn.get(el, 0) >= 8]
             b_site = [el for el in cation_elements if max_cn.get(el, 0) == 6]
             motif.update(
                 family="perovskite",
-                name=f"钙钛矿型 {pos.formula()}",
-                a_site=a_site or [cation_elements[0]],
-                b_site=b_site or [cation_elements[-1]],
+                name=f"钙钛矿候选 {pos.formula()}",
+                a_site=a_site,
+                b_site=b_site,
                 notes=[
                     "B 位过渡金属（CN=6）承担磁矩；A 位（La/Sr/Ba/Ca/稀土，CN≥8）"
                     "通常非磁或为 4f 磁矩。",
@@ -1251,36 +1125,41 @@ def detect_motif(
             return motif
 
         # ---- 岩盐 / 闪锌矿 / 纤锌矿 AO -------------------------------
-        if len(norm) == 2 and norm.get(anion) == 1:
+        if len(norm) == 2 and norm.get(anion) == 1 and n_cations == 1:
             cation = cation_elements[0] if cation_elements else None
-            family, name = "rocksalt", f"岩盐型 {pos.formula()}"
-            if cation and max_cn.get(cation, 0) == 4:
+            family, name = None, None
+            cation_indices = [i for i, el in enumerate(pos.symbols) if el == cation]
+            if (cation and max_cn.get(cation, 0) == 6 and max_cn.get(anion, 0) == 6
+                    and any(has_site_geometry(i, "octahedral") for i in cation_indices)):
+                family, name = "rocksalt", f"岩盐候选 {pos.formula()}"
+            elif (cation and max_cn.get(cation, 0) == 4 and max_cn.get(anion, 0) == 4
+                    and any(has_site_geometry(i, "tetrahedral") for i in cation_indices)):
                 if _lattice_kind(pos) == "hexagonal":
-                    family, name = "wurtzite", f"纤锌矿型 {pos.formula()}"
+                    family, name = "wurtzite", f"纤锌矿候选 {pos.formula()}"
                 else:
-                    family, name = "zincblende", f"闪锌矿型 {pos.formula()}"
-            motif.update(
-                family=family, name=name,
-                notes=["岩盐型氧化物（MnO/FeO/CoO/NiO）多为反铁磁，需要正负号交替。"],
-            )
-            return motif
+                    family, name = "zincblende", f"闪锌矿候选 {pos.formula()}"
+            if family is not None:
+                motif.update(family=family, name=name)
+                motif["notes"].append("配位和局部键角仅支持结构候选；磁序还需核验周期与材料信息。")
+                return motif
 
         # ---- 金红石 MO2 --------------------------------------------
-        if norm.get(anion) == 2 and len(cation_elements) == 1:
+        if norm.get(anion) == 2 and len(cation_elements) == 1 and n_cations == 1:
             cation = cation_elements[0]
             if max_cn.get(cation, 0) == 6:
                 motif.update(
                     family="rutile",
-                    name=f"金红石型 {pos.formula()}",
+                    name=f"金红石等六配位 MO2 候选 {pos.formula()}",
                     notes=["阳离子六配位、阴离子三配位；按阳离子价态给高自旋磁矩。"],
                 )
                 return motif
 
         # ---- 刚玉 A2O3 ---------------------------------------------
-        if norm.get(anion) == 3 and n_cations == 2:
+        if (norm.get(anion) == 3 and n_cations == 2 and len(cation_elements) == 1
+                and max_cn.get(cation_elements[0], 0) == 6):
             motif.update(
                 family="corundum",
-                name=f"刚玉型 {pos.formula()}",
+                name=f"刚玉等六配位 M2O3 候选 {pos.formula()}",
                 notes=["Cr2O3 / Fe2O3 / Al2O3 等，磁性时通常为反铁磁。"],
             )
             return motif
@@ -1325,11 +1204,12 @@ _KB_LIST = [
         {"Fe": 3, "O": 4}, "磁铁矿 Fe3O4（反尖晶石）", "ferrimagnetic",
         [
             {"element": "Fe", "coordination": 4, "moment": 5.0, "site": "8a 四面体 Fe3+"},
-            {"element": "Fe", "coordination": 6, "moment": -5.0,
+            {"element": "Fe", "coordination": 6, "moment": -4.5,
              "site": "16d 八面体 Fe2+/Fe3+"},
             {"element": "O", "moment": 0.0, "site": "32e"},
         ],
-        note="亚铁磁：8a Fe3+ 与整个 16d 亚晶格反平行（16d 内部同向）；八面体混合价用 |5| 作初猜。",
+        note="亚铁磁：8a Fe3+ 与整个 16d 亚晶格反平行（16d 内部同向）；"
+             "八面体等量 Fe2+/Fe3+ 用平均 |4.5| 作初猜，不代表已解析低温电荷有序。",
     ),
     _kb_entry(
         {"Co": 3, "O": 4}, "Co3O4（正尖晶石）", "antiferromagnetic",
@@ -1363,14 +1243,16 @@ _KB_LIST = [
         note="Co2+ 高自旋 S=3/2；16d 亚晶格整体与 8a 反平行。",
     ),
     _kb_entry(
-        {"Mn": 1, "Fe": 2, "O": 4}, "锰铁氧体 MnFe2O4（多为反尖晶石）", "ferrimagnetic",
+        {"Mn": 1, "Fe": 2, "O": 4}, "锰铁氧体 MnFe2O4（阳离子占位可变）", "ferrimagnetic",
         [
             {"element": "Fe", "coordination": 4, "moment": 5.0},
             {"element": "Fe", "coordination": 6, "moment": -5.0},
+            {"element": "Mn", "coordination": 4, "moment": 5.0},
             {"element": "Mn", "coordination": 6, "moment": -5.0},
             {"element": "O", "moment": 0.0},
         ],
-        note="Mn2+ 高自旋 S=5/2；实际阳离子分布随合成条件变化。",
+        note="Mn2+ 高自旋 S=5/2；正/部分反尖晶石的实际占位随条件变化，"
+             "Mn、Fe 均按四面体与八面体亚晶格反平行赋号。",
     ),
     _kb_entry(
         {"Zn": 1, "Fe": 2, "O": 4}, "锌铁氧体 ZnFe2O4（正尖晶石）", "antiferromagnetic",
@@ -1460,7 +1342,7 @@ _KB_LIST = [
         note="Fe3+ S=5/2；G 型反铁磁，最近邻 Fe 自旋相反。",
     ),
     _kb_entry(
-        {"Bi": 1, "Fe": 1, "O": 3}, "BiFeO3（G 型反铁磁 + 弱铁电）", "antiferromagnetic",
+        {"Bi": 1, "Fe": 1, "O": 3}, "BiFeO3（G 型反铁磁，多铁性）", "antiferromagnetic",
         [
             {"element": "Fe", "coordination": 6, "moment": 5.0},
             {"element": "Bi", "moment": 0.0},
@@ -1585,23 +1467,25 @@ _KB_LIST = [
     ),
     # ---------- 闪锌矿 / 纤锌矿 ----------
     _kb_entry(
-        {"Mn": 1, "S": 1}, "MnS（闪锌矿/纤锌矿，反铁磁）", "antiferromagnetic",
-        [{"element": "Mn", "coordination": 4, "moment": 5.0},
+        {"Mn": 1, "S": 1}, "MnS（岩盐/闪锌矿/纤锌矿多晶型）", "antiferromagnetic",
+        [{"element": "Mn", "moment": 5.0},
          {"element": "S", "moment": 0.0}],
         afm=["Mn"],
-        note="Mn2+ 高自旋 S=5/2；四配位亚晶格反铁磁。",
+        note="Mn2+ 高自旋 S=5/2；α-MnS 为岩盐六配位，其他多晶型可四配位，磁序须结合结构。",
     ),
     _kb_entry(
         {"Mn": 1, "Se": 1}, "MnSe（反铁磁）", "antiferromagnetic",
-        [{"element": "Mn", "coordination": 4, "moment": 5.0},
+        [{"element": "Mn", "moment": 5.0},
          {"element": "Se", "moment": 0.0}],
         afm=["Mn"],
+        note="Mn2+ 高自旋；存在不同多晶型，不能仅由化学式假定为四配位。",
     ),
     _kb_entry(
         {"Mn": 1, "Te": 1}, "MnTe（反铁磁）", "antiferromagnetic",
-        [{"element": "Mn", "coordination": 4, "moment": 5.0},
+        [{"element": "Mn", "moment": 5.0},
          {"element": "Te", "moment": 0.0}],
         afm=["Mn"],
+        note="常见 α-MnTe 为 NiAs 型六配位，层内铁磁、层间反铁磁；其他多晶型须另行判断。",
     ),
     _kb_entry(
         {"Zn": 1, "S": 1}, "ZnS 闪锌矿/纤锌矿（非磁）", "nonmagnetic",
@@ -1638,7 +1522,7 @@ _KB_LIST = [
             {"element": "Sr", "moment": 0.0},
             {"element": "O", "moment": 0.0},
         ],
-        note="Fe3+(↑) 与 Re5+(4d2, ↓) 反平行。",
+        note="Fe3+(↑) 与 Re5+(5d2, ↓) 反平行。",
     ),
     _kb_entry(
         {"La": 2, "Ni": 1, "Mn": 1, "O": 6},
@@ -1759,6 +1643,10 @@ def _parse_formula(text: str) -> Optional[Dict[str, int]]:
             stack.append({})
             i += 1
         elif c in ")]":
+            if len(stack) == 1:
+                # 多余的右括号：忽略，避免弹空栈后崩溃。
+                i += 1
+                continue
             group = stack.pop()
             i += 1
             j = i
@@ -1790,179 +1678,124 @@ def _parse_formula(text: str) -> Optional[Dict[str, int]]:
 # ============================================================================
 # 6. 反铁磁符号分配（二部图染色）
 # ============================================================================
-def _candidate_axes(lattice: np.ndarray) -> List[np.ndarray]:
-    """生成候选磁序方向：晶格矢量、两两和/差、体对角线。"""
-    a, b, c = lattice
-    vecs = [a, b, c,
-            a + b, a + c, b + c, a - b, a - c, b - c,
-            a + b + c, a + b - c, a - b + c, -a + b + c]
-    axes = []
-    for v in vecs:
-        n = np.linalg.norm(v)
-        if n > 1e-8:
-            axes.append(v / n)
-    return axes
-
-
-def _min_positive_gap(proj: np.ndarray) -> Optional[float]:
-    vals = np.sort(np.unique(np.round(proj, 6)))
-    if len(vals) < 2:
-        return None
-    gaps = np.diff(vals)
-    gaps = gaps[gaps > 1e-4]
-    return float(np.min(gaps)) if len(gaps) else None
-
-
-def _quantize_levels(proj: np.ndarray, tol: float) -> np.ndarray:
-    order = np.argsort(proj)
-    levels = np.zeros(len(proj), dtype=int)
-    lvl = 0
-    ref = proj[order[0]]
-    for pos in order[1:]:
-        if proj[pos] - ref > tol:
-            lvl += 1
-            ref = proj[pos]
-        levels[pos] = lvl
-    return levels
-
-
-def layered_signs(
-    pos: Poscar,
-    indices: Sequence[int],
-    axis: Optional[Sequence[float]] = None,
-    tol_frac: float = 0.4,
-) -> Dict[int, int]:
-    """按“磁层”交替给符号：把磁性原子投影到某方向，按层号奇偶给 ±。
-
-    这是 fcc 岩盐（NiO/CoO/MnO 的 II 型反铁磁）、尖晶石八面体亚晶格等
-    非二部图体系的标准初猜方式。axis=None 时自动在候选方向中挑最佳者。
-    """
+def _magnetic_contacts(pos: Poscar, indices: Sequence[int], cutoff: float = 8.0):
+    """磁性位点所有周期接触，保留自镜像及跨边界键。"""
     idx = list(indices)
-    if len(idx) <= 1:
-        return {i: 1 for i in idx}
-    cart = pos.cartesian()[idx]
-    local = {g: k for k, g in enumerate(idx)}
+    cart = (pos.frac % 1.0) @ pos.lattice
+    offsets = _image_offsets(pos.lattice, cutoff)
+    contacts = []
+    for i in idx:
+        for j in idx:
+            vectors = cart[j] - cart[i] + offsets
+            lengths = np.linalg.norm(vectors, axis=1)
+            for k in np.flatnonzero((lengths > 1e-7) & (lengths <= cutoff)):
+                contacts.append((i, j, float(lengths[k]), vectors[k]))
+    return contacts
 
-    pairs = min_image_distances(pos, cutoff=8.0, indices=idx)
-    if len(pairs) == 0:
-        return {i: 1 for i in idx}
-    dmin = float(np.min(pairs[:, 2]))
-    nn = pairs[pairs[:, 2] <= dmin * 1.2]
-    ii = [local[int(a)] for a, _, _ in nn]
-    jj = [local[int(b)] for _, b, _ in nn]
 
-    if axis is not None:
-        axes = [np.array(axis, dtype=float) / np.linalg.norm(axis)]
-    else:
-        axes = _candidate_axes(pos.lattice)
+def _phase_signs(pos: Poscar, indices: Sequence[int], q: np.ndarray) -> Dict[int, int]:
+    """q 为 Cartesian 倒空间传播矢量（cycles/Å），验证晶胞平移保持自旋。"""
+    translations = pos.lattice @ q
+    if not np.allclose(translations, np.rint(translations), atol=1e-5, rtol=0):
+        raise ValueError("当前晶胞与目标 AFM 传播矢量不相容；请构造磁性超胞后重试")
+    idx = list(indices)
+    phase = (pos.frac[idx] % 1.0) @ pos.lattice @ q
+    twice = 2 * (phase - phase[0])
+    if not np.allclose(twice, np.rint(twice), atol=0.08, rtol=0):
+        raise ValueError("磁性位点不在所指定的两类共线磁层上；请提供明确的位点磁矩")
+    signs = np.where(np.rint(twice).astype(int) % 2 == 0, 1, -1)
+    if len(set(signs)) < 2:
+        raise ValueError("当前晶胞无法产生两类相反自旋；请构造磁性超胞")
+    return dict(zip(idx, map(int, signs)))
 
-    best = None
-    for ax in axes:
-        proj = cart @ ax
-        sp = _min_positive_gap(proj)
-        if not sp:
+
+def layered_signs(pos: Poscar, indices: Sequence[int],
+                  axis: Optional[Sequence[float]] = None, tol_frac: float = 0.4) -> Dict[int, int]:
+    """显式 Cartesian 层法向的交替磁序；不从近邻反号比例猜测磁序类型。"""
+    idx = list(indices)
+    if len(idx) < 2 or axis is None:
+        raise ValueError("层状 AFM 需要至少两个磁性位点和明确的层法向；请指定磁序或磁性超胞")
+    normal = np.asarray(axis, dtype=float)
+    if normal.shape != (3,) or not np.all(np.isfinite(normal)) or np.linalg.norm(normal) < 1e-9:
+        raise ValueError("AFM 层法向必须是有限非零三维向量")
+    normal /= np.linalg.norm(normal)
+    cart = (pos.frac[idx] % 1.0) @ pos.lattice
+    # 包含晶格平移后的层间距，避免只看到有限晶胞中缺失的层。
+    proj = np.concatenate([(cart + offset) @ normal for offset in
+                           _image_offsets(pos.lattice, 0.0)])
+    gaps = np.diff(np.unique(np.round(proj, 5)))
+    gaps = gaps[gaps > 1e-4]
+    if not len(gaps):
+        raise ValueError("未找到不同磁层；请指定磁性超胞")
+    return _phase_signs(pos, idx, normal / (2 * float(gaps.min())))
+
+
+def rocksalt_type2_signs(pos: Poscar, indices: Sequence[int]) -> Dict[int, int]:
+    """由 fcc 阳离子次近邻立方轴构造 (111) AFM-II，并验证磁胞相容性。"""
+    idx = list(indices)
+    if len(idx) < 2:
+        raise ValueError("岩盐 AFM-II 至少需要两个磁性位点；请构造磁性超胞")
+    contacts = _magnetic_contacts(pos, idx)
+    if not contacts:
+        raise ValueError("未识别到岩盐磁性亚晶格")
+    origin = idx[0]
+    local = [(d, v) for i, j, d, v in contacts if i == origin]
+    dmin = min(d for d, v in local)
+    # fcc 次近邻距离为最近邻的 sqrt(2) 倍。
+    vectors = [v for d, v in local if abs(d / dmin - math.sqrt(2)) < 0.04]
+    for trio in itertools.combinations(vectors, 3):
+        axes = np.array(trio)
+        gram = axes @ axes.T
+        if not np.allclose(gram, np.eye(3) * gram[0, 0], rtol=0.04, atol=0.04):
             continue
-        levels = _quantize_levels(proj, tol_frac * sp)
-        li = levels[ii]
-        lj = levels[jj]
-        score = float(np.mean((li % 2) != (lj % 2))) if len(li) else 0.0
-        # 偏好层数少、两类原子尽量均衡的方案
-        balance = 1.0 - abs(np.mean(levels % 2) - 0.5) * 2
-        key = (round(score, 4), round(balance, 4), -len(set(levels.tolist())))
-        if best is None or key > best[0]:
-            best = (key, levels)
-
-    if best is None:
-        return {i: 1 for i in idx}
-    levels = best[1]
-    return {g: (1 if levels[k] % 2 == 0 else -1) for k, g in enumerate(idx)}
+        for signs in itertools.product((-1, 1), repeat=3):
+            q = 0.5 * np.sum(axes * np.array(signs)[:, None], axis=0) / gram[0, 0]
+            try:
+                return _phase_signs(pos, idx, q)
+            except ValueError:
+                continue
+    raise ValueError("未找到与当前晶胞相容的岩盐 (111) AFM-II；请构造磁性超胞或明确给出位点磁矩")
 
 
-def bipartite_signs(
-    pos: Poscar,
-    element: Optional[str] = None,
-    neigh: Optional[List[List[Tuple[int, float]]]] = None,
-    nn_tolerance: float = 1.15,
-    indices: Optional[Sequence[int]] = None,
-) -> Dict[int, int]:
-    """对指定磁性亚晶格做近邻图二部图染色，返回 {atom_index: +1/-1}。
-
-    为正确处理小晶胞中的周期镜像（例如 8 原子 NiO 惯用胞），先把亚晶格扩成
-    3x3x3 超胞再对该“展开图”二染色，最后取中心拷贝的符号。
-    对 fcc / bcc 等二部图晶格，这正好给出面间反平行的反铁磁初猜。
-    """
-    if indices is not None:
-        idx = list(indices)
-    elif element is None:
-        idx = list(range(pos.n_atoms))
-    else:
-        idx = [i for i, s in enumerate(pos.symbols) if s == element]
-    if len(idx) <= 1:
-        return {i: 1 for i in idx}
-
-    base = pos.frac[idx]
-    lattice = pos.lattice
-    shifts = list(itertools.product((-1, 0, 1), repeat=3))
-    shifts.sort(key=lambda s: (abs(s[0]) + abs(s[1]) + abs(s[2]), s))
-    home = shifts.index((0, 0, 0))
-
-    fracs = []
-    for sh in shifts:
-        for f in base:
-            fracs.append(f + np.array(sh, dtype=float))
-    fracs = np.array(fracs)
-    cart = fracs @ lattice
-    nnode = len(cart)
-    chunk = max(64, min(512, 8_000_000 // max(1, nnode)))
-
-    # 第一遍：分块求展开图内最近邻间距
-    def _chunk_dist(s: int, e: int) -> np.ndarray:
-        d = np.linalg.norm(cart[s:e, None, :] - cart[None, :, :], axis=2)
-        for a in range(e - s):
-            d[a, s + a] = np.inf
-        return d
-
-    dmin = np.inf
-    for s in range(0, nnode, chunk):
-        e = min(nnode, s + chunk)
-        dmin = min(dmin, float(_chunk_dist(s, e).min()))
-    if not np.isfinite(dmin):
-        return {i: 1 for i in idx}
-    cut = dmin * nn_tolerance
-
-    # 第二遍：建近邻图
-    adj: List[List[int]] = [[] for _ in range(nnode)]
-    for s in range(0, nnode, chunk):
-        e = min(nnode, s + chunk)
-        d = _chunk_dist(s, e)
-        for a, b in np.argwhere(d <= cut):
-            u = s + int(a)
-            v = int(b)
-            if u != v:
-                adj[u].append(v)
-
-    # BFS 二染色
-    color = np.full(nnode, 0, dtype=int)
-    ok = True
-    for start in range(nnode):
-        if color[start] != 0:
+def bipartite_signs(pos: Poscar, element: Optional[str] = None,
+                    neigh: Optional[List[List[Tuple[int, float]]]] = None,
+                    nn_tolerance: float = 1.15,
+                    indices: Optional[Sequence[int]] = None) -> Dict[int, int]:
+    """直接染色周期商图；每条周期最近邻键都必须连接相反自旋。"""
+    idx = list(indices) if indices is not None else [
+        i for i, el in enumerate(pos.symbols) if element is None or el == element]
+    if len(idx) < 2:
+        raise ValueError("AFM 至少需要两个非零磁性位点；请构造磁性超胞")
+    contacts = _magnetic_contacts(pos, idx)
+    if not contacts:
+        raise ValueError("未找到磁性近邻；不能自动确定 AFM 磁序")
+    nearest = {i: min(d for a, b, d, v in contacts if a == i) for i in idx}
+    adj = {i: set() for i in idx}
+    for i, j, d, vector in contacts:
+        if d <= min(nearest[i], nearest[j]) * nn_tolerance:
+            if i == j:
+                raise ValueError("AFM 最近邻为自身周期镜像，当前晶胞过小；请构造磁性超胞")
+            adj[i].add(j)
+            adj[j].add(i)
+    color = {}
+    # 几何排序使原子重排只影响整体自旋翻转，而不改变相对磁序。
+    ordered = sorted(idx, key=lambda i: tuple(np.round(pos.frac[i] % 1.0, 8)))
+    for start in ordered:
+        if start in color:
             continue
+        if not adj[start]:
+            raise ValueError("磁性近邻图存在孤立位点；请明确给出位点磁矩")
         color[start] = 1
-        dq = deque([start])
-        while dq:
-            u = dq.popleft()
-            for v in adj[u]:
-                if color[v] == 0:
-                    color[v] = -color[u]
-                    dq.append(v)
-                elif color[v] == color[u]:
-                    ok = False
-
-    if ok:
-        return {idx[k]: int(color[home * len(idx) + k]) for k in range(len(idx))}
-
-    # fcc 等非二部图：退化为按磁层投影交替
-    return layered_signs(pos, idx)
+        queue = deque([start])
+        while queue:
+            i = queue.popleft()
+            for j in adj[i]:
+                if j not in color:
+                    color[j] = -color[i]
+                    queue.append(j)
+                elif color[j] == color[i]:
+                    raise ValueError("周期磁性近邻图不是二部图，无法确定此 AFM 磁序；请提供明确位点磁矩或合适磁性超胞")
+    return color
 
 
 # ============================================================================
@@ -1972,8 +1805,7 @@ def analyze_structure(pos: Poscar, max_sites: int = 400) -> Dict:
     neigh = coordination_analysis(pos)
     ctx = site_context(pos, neigh)
     motif = detect_motif(pos, neigh, ctx["system_type"])
-    comp = pos.composition()
-    kb = KNOWLEDGE_BASE.get(canonical_formula(pos.reduced_composition()))
+    kb = _compatible_kb(pos, motif, ctx["system_type"])
 
     layers = ctx.get("layers")
     depths = ctx.get("layer_depth")
@@ -2098,104 +1930,98 @@ def _role_matches(site_role: Optional[str], actual: str) -> bool:
     return actual == role
 
 
+def _finite_moment(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("moment 必须是有限数值")
+    return float(value)
+
+
 def build_moments_from_assignments(
-    pos: Poscar,
-    report: Dict,
-    assignments: Sequence[Dict],
-    overrides: Optional[Sequence[Dict]] = None,
-    afm: Optional[Sequence] = None,
+    pos: Poscar, report: Dict, assignments: Sequence[Dict],
+    overrides: Optional[Sequence[Dict]] = None, afm: Optional[Sequence] = None,
     afm_elementwise: bool = False,
 ) -> List[float]:
-    """根据 LLM 给出的规则计算逐原子磁矩。
-
-    每条 assignment 支持：
-      element       元素符号（必需）
-      coordination  配位数（可选，用于区分四面体/八面体/表面不饱和位点）
-      site_role     位点角色（可选：any/surface/top_surface/bottom_surface/
-                    subsurface/interior/bulk/cluster）
-      moment        磁矩（可带正负号）
-      afm_group     反铁磁组名（可选，供 afm 参数引用）
-    匹配按列表顺序，先到先得。
-    """
+    """严格按顺序匹配显式规则；不由低配位数猜测母位点/氧化态。"""
+    if not isinstance(assignments, (list, tuple)):
+        raise ValueError("assignments 必须是规则列表")
+    valid_roles = {"any", "all", "*", "surface", "surface_top", "surface_bottom",
+                   "top_surface", "bottom_surface", "subsurface", "interior", "bulk", "cluster"}
+    for rule in assignments:
+        if not isinstance(rule, dict) or "element" not in rule or "moment" not in rule:
+            raise ValueError("每条 assignment 必须包含 element 和 moment")
+        if rule["element"] not in pos.symbols:
+            raise ValueError(f"规则元素不存在于 POSCAR: {rule['element']}")
+        _finite_moment(rule["moment"])
+        cn = rule.get("coordination")
+        if cn is not None and (type(cn) is not int or cn < 0):
+            raise ValueError("coordination 必须是非负整数")
+        if rule.get("site_role", "any") not in valid_roles:
+            raise ValueError("未知 site_role")
+        if "afm_group" in rule and (not isinstance(rule["afm_group"], str) or not rule["afm_group"]):
+            raise ValueError("afm_group 必须是非空字符串")
+    if not isinstance(overrides or [], (list, tuple)):
+        raise ValueError("site_overrides 必须是列表")
+    override_map = {}
+    for ov in overrides or []:
+        if not isinstance(ov, dict) or type(ov.get("index")) is not int or "moment" not in ov:
+            raise ValueError("site_overrides 必须包含整数 index 和 moment")
+        i = ov["index"]
+        if not 0 <= i < pos.n_atoms or i in override_map:
+            raise ValueError("site_overrides 索引越界或重复")
+        override_map[i] = _finite_moment(ov["moment"])
     neigh = coordination_analysis(pos)
-    cn_list = [len(x) for x in neigh]
     ctx = site_context(pos, neigh)
-    roles = ctx["roles"]
-
     base = [0.0] * pos.n_atoms
-    site_group: List[Optional[str]] = [None] * pos.n_atoms
+    groups = [None] * pos.n_atoms
+    missing = []
     for i, el in enumerate(pos.symbols):
-        chosen = None
-        fallback = None  # (排序键, assignment)
-        for oi, a in enumerate(assignments):
-            ael = a.get("element")
-            if ael and ael != el:
-                continue
-            if "site_role" in a and not _role_matches(a.get("site_role"), roles[i]):
-                continue
-            coord = a.get("coordination")
-            if coord is None or int(coord) == cn_list[i]:
-                chosen = a
-                break
-            # 配位数不完全匹配时（常见于 slab 表面不饱和位），
-            # 退回该元素最接近的指定配位数（优先高配位，即体相“母位点”）
-            cand = int(coord)
-            above = cand > cn_list[i]
-            dist = (cand - cn_list[i]) if above else (10_000 + (cn_list[i] - cand))
-            key = (dist, oi)
-            if fallback is None or key < fallback[0]:
-                fallback = (key, a)
-        if chosen is None and fallback is not None:
-            chosen = fallback[1]
+        chosen = next((rule for rule in assignments
+                       if rule["element"] == el
+                       and _role_matches(rule.get("site_role"), ctx["roles"][i])
+                       and (rule.get("coordination") is None or rule["coordination"] == len(neigh[i]))), None)
         if chosen is None:
+            if i not in override_map:
+                missing.append(i)
+        else:
+            base[i] = float(chosen["moment"])
+            groups[i] = chosen.get("afm_group")
+    if missing:
+        raise ValueError(f"规则未覆盖位点 {missing[:20]}；请提供明确配位/表面规则或逐位点覆盖")
+    if not isinstance(afm or [], (list, tuple)) or any(not isinstance(x, str) for x in afm or []):
+        raise ValueError("afm_elements 必须是元素或组名列表")
+    tokens = set(afm or [])
+    known = set(pos.symbols) | {g for g in groups if g}
+    if tokens - known:
+        raise ValueError(f"未知 AFM 元素/组名: {sorted(tokens - known)}")
+    members_by_group = {}
+    for i, m in enumerate(base):
+        if abs(m) < 1e-9:
             continue
-        base[i] = float(chosen.get("moment", 0.0))
-        g = chosen.get("afm_group")
-        site_group[i] = str(g) if g else None
-
-    # ---- 反铁磁/亚铁磁符号：每个位点只应用一次（组名优先于元素名）----
-    afm_set = {str(t) for t in (afm or [])}
-    for a in assignments:
-        if a.get("afm_group"):
-            afm_set.add(str(a["afm_group"]))
-
-    token_of: List[Optional[str]] = []
-    if afm_elementwise:
-        # magnetic_order="afm"：直接对元素做全局正负交替，忽略分组
-        for el in pos.symbols:
-            token_of.append(el if el in afm_set else None)
-    else:
-        for i, el in enumerate(pos.symbols):
-            if site_group[i]:
-                token_of.append(site_group[i])
-            elif el in afm_set:
-                token_of.append(el)
-            else:
-                token_of.append(None)
-
-    token_members: Dict[str, List[int]] = {}
-    for i, tok in enumerate(token_of):
-        if tok:
-            token_members.setdefault(tok, []).append(i)
-
-    signs = [1] * pos.n_atoms
-    for members in token_members.values():
-        s = bipartite_signs(pos, indices=members)
-        for atom_i, sign in s.items():
-            signs[atom_i] = 1 if sign > 0 else -1
-
-    moments = [
-        (abs(base[i]) * signs[i]) if token_of[i] is not None else base[i]
-        for i in range(pos.n_atoms)
-    ]
-
-    if overrides:
-        for ov in overrides:
-            i = int(ov["index"])
-            if 0 <= i < pos.n_atoms:
-                moments[i] = float(ov["moment"])
-
-    return moments
+        if afm_elementwise and not tokens:
+            token = "__all_magnetic_sites__"
+        elif groups[i] in tokens:
+            token = groups[i]
+        elif pos.symbols[i] in tokens:
+            token = "__selected_elements__"
+        else:
+            continue
+        members_by_group.setdefault(token, []).append(i)
+    if tokens and not members_by_group:
+        raise ValueError("AFM 选择没有非零磁性位点")
+    if members_by_group and override_map:
+        raise ValueError("自动 AFM 不接受 site_overrides；显式磁序请用 auto 并完整指定正负磁矩")
+    for members in members_by_group.values():
+        # 岩盐 3d 一氧化物使用指定的 II 型，而非按最大反号键比例猜磁序。
+        if (report.get("motif", {}).get("family") == "rocksalt"
+                and set(pos.symbols) in ({"Ni", "O"}, {"Mn", "O"}, {"Fe", "O"}, {"Co", "O"})):
+            signs = rocksalt_type2_signs(pos, members)
+        else:
+            signs = bipartite_signs(pos, indices=members)
+        for i, sign in signs.items():
+            base[i] = abs(base[i]) * sign
+    for i, m in override_map.items():
+        base[i] = m
+    return base
 
 
 def _sub_poscar(pos: Poscar, indices: Sequence[int]) -> Poscar:
@@ -2237,21 +2063,23 @@ def validate_moments(moments: Sequence[float], n_atoms: int) -> List[str]:
 def _fmt(x: float) -> str:
     if abs(x - round(x)) < 1e-9:
         return str(int(round(x)))
-    return f"{x:.3f}".rstrip("0").rstrip(".")
+    return f"{x:.8g}"
 
 
 def format_magmom(
-    pos: Poscar, moments: Sequence[float], ispin: int = 2, compact: bool = True
+    pos: Poscar, moments: Sequence[float], ispin: Optional[int] = None, compact: bool = True
 ) -> str:
     """生成与 add-spin.py 风格一致的 ISPIN / MAGMOM 文本块。"""
     if len(moments) != pos.n_atoms:
         raise ValueError("磁矩数量与原子数不一致")
+    moments = [_finite_moment(m) for m in moments]
+    ispin = resolve_ispin(moments, ispin)
 
     if ispin == 1:
         return (
-            "Mag parameter\n"
+            "# Mag parameter\n"
             "   ISPIN = 1\n"
-            "   # 非自旋极化：体系判定为非磁，无需 MAGMOM\n"
+            "   # 非自旋极化候选：本方案所有初始磁矩为零，无需 MAGMOM\n"
         )
 
     # 含负值时（反铁磁/亚铁磁）VASP 的 n*value 缩写不易读，直接逐原子展开
@@ -2275,7 +2103,7 @@ def format_magmom(
         magmom_line = "   ".join(_fmt(m) for m in moments)
 
     # 元素注释：优先按元素块压缩
-    elem_parts, num_parts = [], []
+    elem_parts = []
     uniform = True
     for el, a, b in pos.blocks():
         vals = moments[a:b]
@@ -2290,7 +2118,7 @@ def format_magmom(
         header += "   （同一元素内部存在不同磁矩，MAGMOM 按 POSCAR 原子顺序逐一对应）"
 
     lines = [
-        "Mag parameter",
+        "# Mag parameter",
         f"   ISPIN = {ispin}",
         f"   {header}",
         f"   MAGMOM =  {magmom_line}",
@@ -2299,99 +2127,222 @@ def format_magmom(
 
 
 def append_to_incar(block: str, incar: str = "INCAR") -> None:
-    with open(incar, "a", encoding="utf-8") as f:
-        f.write("\n" + block)
+    """保留其余参数，替换已有共线自旋参数；拒绝覆盖不兼容的计算模式。"""
+    old = ""
+    if os.path.exists(incar):
+        with open(incar, "r", encoding="utf-8") as f:
+            old = f.read()
+    kept = []
+    logical_lines = []
+    pending = ""
+    for raw in old.splitlines():
+        pieces = re.split(r"([#!].*)", raw, maxsplit=1)
+        active = pieces[0].rstrip()
+        if active.endswith("\\"):
+            pending += active[:-1] + " "
+            if len(pieces) > 1:
+                logical_lines.append(pieces[1])
+        else:
+            logical_lines.append(pending + raw)
+            pending = ""
+    if pending:
+        raise ValueError("INCAR 存在未结束的续行，拒绝修改")
+    for line in logical_lines:
+        pieces = re.split(r"([#!].*)", line, maxsplit=1)
+        active, comment = pieces[0], "".join(pieces[1:])
+        remaining = []
+        for segment in active.split(";"):
+            match = re.match(r"\s*([A-Za-z_]+)\s*=\s*(.*?)\s*$", segment)
+            if not match:
+                if segment.strip() and segment.strip() != "Mag parameter":
+                    remaining.append(segment.strip())
+                continue
+            tag, value = match.group(1).upper(), match.group(2)
+            if tag in ("LSORBIT", "LNONCOLLINEAR") and value.strip(". ").upper() in ("TRUE", "T"):
+                raise ValueError(f"INCAR 启用了 {tag}，本工具仅支持共线磁性")
+            if tag == "NUPDOWN":
+                try:
+                    constrained = float(value) >= 0
+                except ValueError:
+                    constrained = True
+                if constrained:
+                    raise ValueError("INCAR 已有固定总自旋 NUPDOWN；请先明确其与新磁矩方案的关系")
+            if tag not in ("ISPIN", "MAGMOM"):
+                remaining.append(segment.strip())
+        # 清理本工具上次的标题，保留用户的其他注释。
+        if comment.strip() == "# Mag parameter":
+            comment = ""
+        content = "; ".join(remaining)
+        if comment:
+            content += ("  " if content else "") + comment
+        if content or not line.strip():
+            kept.append(content)
+    new = "\n".join(kept).rstrip() + "\n\n" + block
+    # 所有校验先完成，再写同目录临时文件并原子替换，避免部分写入。
+    import tempfile
+    target = os.path.abspath(incar)
+    fd, temporary = tempfile.mkstemp(prefix=".add-spin-", dir=os.path.dirname(target), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new.lstrip("\n"))
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # ============================================================================
 # 9. 无 LLM 时的启发式回退方案
 # ============================================================================
+def _compatible_kb(pos: Poscar, motif: Dict, system_type: str) -> Optional[Dict]:
+    """化学式只是候选检索键，结构类型不符时不自动采用该体相条目。"""
+    if system_type in ("mole", "unknown"):
+        return None
+    kb = KNOWLEDGE_BASE.get(canonical_formula(pos.reduced_composition()))
+    if not kb:
+        return None
+    family = motif.get("family")
+    name = kb["name"]
+    required = None
+    if "尖晶石" in name:
+        required = {"spinel"}
+    elif "双钙钛矿" in name:
+        required = {"double_perovskite"}
+    elif any(el in kb["comp"] for el in ("La", "Sr", "Bi")) and kb["comp"].get("O") == 3:
+        required = {"perovskite"}
+    elif "刚玉" in name or (len(kb["comp"]) == 2 and kb["comp"].get("O") == 3):
+        required = {"corundum"}
+    elif "LDH" in name:
+        required = {"ldh"}
+    elif "水镁石" in name:
+        required = {"hydroxide"}
+    elif "金红石" in name:
+        required = {"rutile"}
+    elif len(kb["comp"]) == 1:
+        required = {"metal"}
+        if system_type != "bulk":
+            return None  # 表面/团簇不能直接照搬体相零磁矩结论。
+        if "bcc" in name and motif.get("metal_lattice") != "bcc":
+            return None
+        if "fcc" in name and "hcp" not in name and motif.get("metal_lattice") != "fcc":
+            return None
+    elif (kb["comp"].get("O") == 1
+          and set(kb["comp"]) in ({"Ni", "O"}, {"Co", "O"}, {"Mn", "O"}, {"Fe", "O"})):
+        required = {"rocksalt"}
+    if required is not None and family not in required:
+        return None
+    return kb
+
+
+def _ionic_seed_moments(comp: Dict[str, int]) -> Tuple[Dict[str, float], bool]:
+    """只有一个未知阳离子时，以常见固定价和电中性求整数价态。"""
+    fixed = {"O": -2, "F": -1, "Cl": -1, "Br": -1, "I": -1,
+             "H": 1, "Li": 1, "Na": 1, "K": 1, "Rb": 1, "Cs": 1,
+             "Be": 2, "Mg": 2, "Ca": 2, "Sr": 2, "Ba": 2, "Zn": 2,
+             "Cd": 2, "Al": 3, "Ga": 3, "Sc": 3, "Y": 3, "La": 3, "Lu": 3}
+    # S/Se/Te/N/P 可能组成多原子阴离子，不能统一当作单原子负价。
+    unknown = [el for el in comp if el not in fixed]
+    moments = {el: float(OXIDE_HS.get(el, default_element_moment(el))) for el in comp}
+    for el in fixed:
+        if el in moments:
+            moments[el] = 0.0
+    if len(unknown) == 1 and set(comp) & {"O", "F", "Cl", "Br", "I"}:
+        el = unknown[0]
+        ox = -sum(fixed[e] * n for e, n in comp.items() if e in fixed) / comp[el]
+        if abs(ox - round(ox)) < 1e-8:
+            ion = MAGNETIC_IONS.get(el, {}).get(int(round(ox)))
+            if ion is not None:
+                # 仅有组成不能确认晶体场；采用非零高自旋种子，低自旋需另行比较。
+                moments[el] = float(ion[1])
+                return moments, True
+    if not unknown and sum(fixed[e] * n for e, n in comp.items()) != 0:
+        raise ValueError("常见固定价模型不满足电中性，可能含过氧/超氧键或带电物种；请明确自旋与电荷")
+    return moments, not unknown
+
+
 def heuristic_plan(pos: Poscar, report: Optional[Dict] = None) -> Tuple[List[float], str]:
-    """在无法调用 LLM 时，用知识库 + 元素常识给出可用初猜。"""
+    """给出受限、可解释的共线种子，不能从几何唯一判定磁基态。"""
     if report is None:
         report = analyze_structure(pos)
-    n = pos.n_atoms
     comp = dict(pos.composition())
-    kb = KNOWLEDGE_BASE.get(canonical_formula(pos.reduced_composition()))
-
+    if report["system_type"] == "mole":
+        if comp == {"O": 2}:
+            distance = min_image_distances(pos, 2.0)
+            if len(distance):
+                return [1.0, 1.0], "[回退] O2 三重态自旋种子，总自旋磁矩 2 μB；未约束 NUPDOWN。"
+        if comp == {"H": 2} and len(min_image_distances(pos, 1.2)):
+            return [0.0, 0.0], "[回退] H2 成键单重态种子。"
+        if pos.n_atoms == 1 and pos.symbols[0] in {"H", "He", "C", "N", "O", "F", "Ne", "Ar"}:
+            spin = {"H": 1., "He": 0., "C": 2., "N": 3., "O": 2., "F": 1., "Ne": 0., "Ar": 0.}
+            return [spin[pos.symbols[0]]], "[回退] 孤立原子自旋种子（不含轨道磁矩）。"
+        raise ValueError("分子/团簇的电荷和自旋多重度未知，无法套用体相磁性；请提供明确磁矩方案")
+    kb = _compatible_kb(pos, report["motif"], report["system_type"])
     if kb:
-        moments = build_moments_from_assignments(
-            pos, report, kb["assignments"], afm=kb.get("afm", [])
-        )
-        return moments, f"[回退] 命中知识库：{kb['name']}（{kb['order']}）。{kb.get('note','')}"
-
-    assignments = []
-    afm = []
-    # 单元素金属
+        if kb.get("afm"):
+            allowed = ({"Ni", "O"}, {"Co", "O"}, {"Mn", "O"}, {"Fe", "O"},
+                       {"La", "Fe", "O"}, {"La", "Cr", "O"}, {"Bi", "Fe", "O"}, {"Cr"})
+            if set(comp) not in allowed and not (set(comp) == {"Co", "O"} and comp["Co"] * 4 == comp["O"] * 3):
+                raise ValueError(f"{kb['name']} 的磁序不能由通用最近邻二染色确定；请明确给出位点磁矩")
+        moments = build_moments_from_assignments(pos, report, kb["assignments"], afm=kb.get("afm", []))
+        return moments, f"[回退] 结构筛选后的知识库候选：{kb['name']}。{kb.get('note', '')} 仍需比较不同磁序的总能。"
     if len(comp) == 1:
         el = next(iter(comp))
-        m = METAL_MOMENT.get(el, 0.0)
-        assignments.append({"element": el, "moment": m})
         if el in ("Cr", "Mn"):
-            afm.append(el)
-        reason = f"[回退] 纯 {el} 金属，取 {m} μB。"
-
-    # 含阴离子的化合物
+            raise ValueError("Cr/Mn 磁序依赖晶型与磁性超胞，请提供明确位点磁矩")
+        if report["system_type"] == "slab" and el not in METAL_MOMENT:
+            raise ValueError("该单元素表面可能与体相磁性不同，请提供明确磁矩方案")
+        m = METAL_MOMENT.get(el, 0.0)
+        moments = [m] * pos.n_atoms
+        reason = "纯元素的有限自旋种子；晶型与表面可能改变磁性"
     elif set(comp) & ANIONS:
-        for el in comp:
-            if el in ANIONS or el in NONMAGNETIC:
-                assignments.append({"element": el, "moment": 0.0})
-            else:
-                m = float(OXIDE_HS.get(el, default_element_moment(el)))
-                assignments.append({"element": el, "moment": m})
-                # 未知氧化物默认按反铁磁给交替符号（更接近多数氧化物基态）
-                if el in ("Cr", "Mn", "Fe", "Co", "Ni", "V"):
-                    afm.append(el)
-        reason = "[回退] 含阴离子化合物，按常见高自旋磁矩 + 反铁磁交替给初猜。"
-
-    # 合金/金属间化合物
+        seeds, resolved = _ionic_seed_moments(comp)
+        moments = [seeds[el] for el in pos.symbols]
+        reason = ("按常见固定价和电中性得到的离子自旋种子（假设无过氧键、无缺陷电荷）" if resolved
+                  else "价态/磁序不能唯一确定，使用元素高自旋同向种子；请另测 AFM/亚铁磁与低自旋候选")
     else:
-        for el in comp:
-            assignments.append({"element": el, "moment": default_element_moment(el)})
-        reason = "[回退] 金属间化合物，按元素常识给初猜。"
-
-    moments = build_moments_from_assignments(pos, report, assignments, afm=afm)
-    return moments, reason
+        moments = [METAL_MOMENT.get(el, 0.0) for el in pos.symbols]
+        reason = "合金的金属自旋种子，局域环境可能改变磁矩"
+    return moments, "[回退] " + reason + "；初猜不代表磁基态。"
 
 
-def plan_from_llm_args(
-    pos: Poscar, report: Dict, args: Dict
-) -> Tuple[List[float], List[str]]:
-    """把 LLM 调用 submit_magmom 的参数转成逐原子磁矩。
+def resolve_ispin(moments: Sequence[float], requested: Optional[int] = None) -> int:
+    if requested is not None and (type(requested) is not int or requested not in (1, 2)):
+        raise ValueError("ISPIN 只能为整数 1 或 2")
+    magnetic = any(abs(_finite_moment(m)) > 1e-9 for m in moments)
+    if requested == 1 and magnetic:
+        raise ValueError("ISPIN=1 与非零 MAGMOM 矛盾")
+    return requested if requested is not None else (2 if magnetic else 1)
 
-    支持 magnetic_order：
-      auto / ferrimagnetic / ferri  按 assignments 的正负号（默认，适合亚铁磁）
-      fm / ferromagnetic            全部取正（铁磁）
-      afm / antiferromagnetic       对每个磁性元素做正负交替（反铁磁）
-      nonmagnetic / nm              全部 0，ISPIN=1
-    """
-    assignments = args.get("assignments") or []
-    overrides = args.get("site_overrides") or []
-    afm = list(args.get("afm_elements") or [])
+
+def plan_from_llm_args(pos: Poscar, report: Dict, args: Dict) -> Tuple[List[float], List[str]]:
+    """校验完整方案后展开，非法/不相容的磁序不得提交。"""
+    if not isinstance(args, dict):
+        raise ValueError("磁矩方案必须是对象")
     order = str(args.get("magnetic_order") or "auto").lower()
-
-    if order in ("nonmagnetic", "non-magnetic", "nm", "none"):
-        return [0.0] * pos.n_atoms, []
-
-    if order in ("afm", "antiferromagnetic", "antiferro"):
-        # 强制对含非零初猜的元素做正负交替
-        magnetic_els = sorted({
-            a.get("element") for a in assignments
-            if a.get("element") and abs(float(a.get("moment", 0.0))) > 1e-9
-        })
-        for el in magnetic_els:
-            if el not in afm:
-                afm.append(el)
-
+    aliases = {"ferromagnetic": "fm", "ferro": "fm", "antiferromagnetic": "afm",
+               "antiferro": "afm", "ferri": "ferrimagnetic", "nm": "nonmagnetic",
+               "non-magnetic": "nonmagnetic", "none": "nonmagnetic"}
+    order = aliases.get(order, order)
+    if order not in ("auto", "fm", "afm", "ferrimagnetic", "nonmagnetic"):
+        raise ValueError(f"未知 magnetic_order: {order}")
+    afm = args.get("afm_elements") or []
+    if afm and order in ("fm", "ferrimagnetic", "nonmagnetic"):
+        raise ValueError("afm_elements 与指定 magnetic_order 矛盾")
     moments = build_moments_from_assignments(
-        pos, report, assignments, overrides, afm,
-        afm_elementwise=(order in ("afm", "antiferromagnetic", "antiferro")),
-    )
-
-    if order in ("fm", "ferromagnetic", "ferro"):
-        moments = [abs(float(m)) for m in moments]
-
+        pos, report, args.get("assignments", []), args.get("site_overrides"), afm,
+        afm_elementwise=(order == "afm"))
+    if order == "nonmagnetic" and any(abs(m) > 1e-9 for m in moments):
+        raise ValueError("nonmagnetic 方案必须明确为所有位点赋零磁矩")
+    if order == "nonmagnetic" and args.get("ispin") not in (None, 1):
+        raise ValueError("nonmagnetic 方案要求 ISPIN=1")
+    if order == "fm":
+        moments = [abs(m) for m in moments]
+    if order in ("afm", "ferrimagnetic") and not (any(m > 1e-9 for m in moments) and any(m < -1e-9 for m in moments)):
+        raise ValueError("AFM/亚铁磁方案必须包含正负两类非零磁矩")
+    resolve_ispin(moments, args.get("ispin"))
     warnings = validate_moments(moments, pos.n_atoms)
+    if order == "afm" and abs(sum(moments)) > 1e-6:
+        warnings.append("AFM 候选的初始总磁矩不为零；请检查子晶格数目、磁矩大小和表面不补偿")
     return moments, warnings
 
 
@@ -2485,14 +2436,14 @@ TOOL_SCHEMAS = [
                         "items": {"type": "string"},
                         "description": (
                             "需要正负号交替的组名或元素符号。组名对应 assignments 中的 afm_group；"
-                            "也可直接写元素符号。自动使用磁层投影/二部图染色。"
+                            "也可直接写元素符号。自动校验周期磁序，无法确定时返回错误。"
                         ),
                     },
                     "magnetic_order": {
                         "type": "string",
                         "enum": ["auto", "fm", "afm", "ferrimagnetic", "nonmagnetic"],
                         "description": (
-                            "整体磁序：fm=铁磁(全部取正)，afm=反铁磁(对磁性元素正负交替)，"
+                            "整体磁序：fm=铁磁(全部取正)，afm=在共同磁性亚晶格上检查周期相容性并赋号，"
                             "ferrimagnetic=亚铁磁(按 assignments 正负号)，nonmagnetic=ISPIN=1。"
                             "默认 auto 等同于 ferrimagnetic。"
                         ),
@@ -2557,7 +2508,7 @@ TOOL_SCHEMAS = [
                             },
                         },
                     },
-                    "ispin": {"type": "integer", "description": "默认 2"},
+                    "ispin": {"type": "integer", "enum": [1, 2], "description": "省略时：全零为1，非零为2"},
                     "rationale": {
                         "type": "string",
                         "description": "简要说明为什么这样设置（中文即可）",
@@ -2571,7 +2522,7 @@ TOOL_SCHEMAS = [
 
 
 # ============================================================================
-# 2. 工具运行时
+# 11. 工具运行时
 # ============================================================================
 class ToolRuntime:
     def __init__(self, pos: Poscar):
@@ -2593,16 +2544,16 @@ class ToolRuntime:
                         "hint": "知识库无此材料，请依据配位环境与元素价态自行推断。"}
             return {"ok": True, "found": True, **entry}
         if name in ("preview_magmom", "submit_magmom"):
-            result = self._apply(args)
-            if name == "submit_magmom":
+            try:
+                result = self._apply(args)
+            except (ValueError, TypeError, KeyError) as exc:
+                return {"ok": False, "error": str(exc)}
+            if name == "submit_magmom" and result.get("ok"):
                 self.submitted = args
             return result
         return {"ok": False, "error": f"未知工具: {name}"}
 
     def _apply(self, args: Dict) -> Dict:
-        assignments = args.get("assignments") or []
-        overrides = args.get("site_overrides") or []
-        afm = args.get("afm_elements") or []
         moments, warnings = plan_from_llm_args(self.pos, self.report, args)
 
         # 按 (元素, 配位数, 位点角色) 汇总，便于 LLM/用户核对
@@ -2619,18 +2570,15 @@ class ToolRuntime:
             for k, v in summary.items()
         }
 
-        covered = {a.get("element") for a in assignments if a.get("element")}
-        uncovered = [
-            i for i, s in enumerate(self.pos.symbols)
-            if s not in covered and s not in NONMAGNETIC
-        ]
         return {
             "ok": True,
             "system_type": self.report.get("system_type", "bulk"),
             "per_site_group": pretty,
             "n_atoms": self.pos.n_atoms,
             "warnings": warnings,
-            "uncovered_magnetic_sites": uncovered[:20],
+            "uncovered_magnetic_sites": [],  # 完整覆盖已由 plan_from_llm_args 强制检查。
+            "ispin": resolve_ispin(moments, args.get("ispin")),
+            "initial_total_moment": round(sum(moments), 6),
             "note": "warnings 非空时请修正方案后重新调用。",
         }
 
@@ -2638,11 +2586,16 @@ class ToolRuntime:
 def element_info(symbol: str) -> Dict:
     symbol = (symbol or "").strip().capitalize()
     ions = MAGNETIC_IONS.get(symbol, {})
+    shell = "f" if symbol in {
+        "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd",
+        "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
+        "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm",
+    } else "d"
     ion_table = {
         f"{symbol}{ox}+": {
             "unpaired_electrons_high_spin": hs,
             "unpaired_electrons_low_spin": ls,
-            "d_electrons": d,
+            f"{shell}_electrons": d,
         }
         for ox, (d, hs, ls) in ions.items()
     }
@@ -2652,100 +2605,30 @@ def element_info(symbol: str) -> Dict:
         "covalent_radius": RCOV.get(symbol),
         "common_oxidation_states": COMMON_OXIDATION.get(symbol, []),
         "magnetic_ions": ion_table,
+        "electron_shell": shell if ions else None,
+        "spin_count_convention": (
+            "f 壳层按 Hund 自旋计数，磁矩为 2S 的初猜；"
+            "不含轨道/SOC，不能视作实验有效磁矩（例如 Eu3+ 的 SOC 基态 J=0）。"
+            if shell == "f" else
+            "d 壳层 HS/LS 指理想八面体晶体场，初猜为 2S 而非 sqrt(n(n+2))；"
+            "平方平面 d8 可为 S=0，须另行判断。"
+        ),
         "default_guess": default_element_moment(symbol),
         "nonmagnetic": symbol in NONMAGNETIC,
+        "nonmagnetic_scope": "仅为常见闭壳层化合物的兜底，不适用于孤立原子、自由基或缺陷。",
         "metal_moment": METAL_MOMENT.get(symbol),
     }
 
 
 # ============================================================================
-# 3. 系统提示词
+# 12. 用户提示词
 # ============================================================================
-SYSTEM_PROMPT = """\
-你是一位资深的第一性原理计算（VASP）专家，专门为 INCAR 设置自旋极化计算（ISPIN=2）的
-MAGMOM 初猜。你的目标不是给出最终收敛值，而是给出**物理上合理、能引导 VASP 收敛到正确
-磁基态**的逐原子初猜磁矩。
-
-## 关键背景
-- MAGMOM 的顺序必须与 POSCAR 中原子出现的顺序**逐原子一一对应**（先按元素分块，
-  每个元素块内部再按坐标行顺序）。
-- 你不需要自己数原子：最终你会把“按 (元素, 配位数, 位点角色) 的赋值规则”交给工具，
-  由脚本展开到每个原子。
-- add-spin.py 里那种“一个元素一个固定值”的粗糙做法在复杂体系会出错。例如：
-  * 体相 fcc Pt 是非磁的，MAGMOM 应该是 0（旧表给的 3 是错的）；
-  * 尖晶石/反尖晶石中同一元素可能占四面体(8a)和八面体(16d)两种位点，磁矩不同；
-  * 岩盐 MnO/FeO/CoO/NiO、刚玉 Cr2O3/Fe2O3 等是反铁磁，需要相邻磁矩正负交替；
-  * LDH/氢氧化物只有层板八面体金属有磁矩，层间阴离子与水一律 0。
-
-## 磁矩大小经验
-- 3d 过渡金属在氧化物/卤化物中通常高自旋，初猜取“未成对电子数”：
-  Ti3+ 1, V3+ 2, V4+ 1, Cr3+ 3, Mn2+ 5, Mn3+ 4, Mn4+ 3, Fe2+ 4, Fe3+ 5,
-  Co2+ 3, Ni2+ 2, Cu2+ 1。
-- 4d/5d 及强场（八面体 + 强配体）常低自旋：Co3+ 八面体低自旋 0，Ru3+ 1~3，Rh3+ 0；
-  但 Mo5+(4d1)=1、Re5+(4d2)=2 等需按 d 电子数给。
-- 4f 稀土：Gd3+ 7, Eu2+ 7, Eu3+ 6, Tb3+ 6, Dy3+ 5, Ho3+ 4, Er3+ 3, Tm3+ 2, Yb3+ 1；
-  La3+/Y3+/Lu3+ 通常非磁。
-- 主族闭壳层（O2-, F-, Al3+, Mg2+, Zn2+, Li+, Ti4+, V5+ 等 d0/d10）一律 0。
-- 纯金属：Fe 2.2, Co 1.7, Ni 0.6；Cr、Mn 是反铁磁（正负交替）；Pt/Pd/Cu/Ag/Au/Al 体相非磁=0。
-- 初猜值可以比实验值略大一些以利于收敛，但不要离谱（一般 |m| ≤ 7）。
-
-## 常见结构类型的磁性处理
-- **尖晶石 AB2O4**：8a 四面体位与 16d 八面体位分别赋值。
-  * 正尖晶石：A 在 8a，B 在 16d（MgAl2O4、ZnFe2O4）。
-  * 反尖晶石：B 在 8a，A、B 共同占 16d（Fe3O4、NiFe2O4、CoFe2O4）。
-  * 亚铁磁（Fe3O4、NiFe2O4）：8a 与整个 16d 亚晶格整体反平行 → 16d 给**负号**，
-    16d 内部同向，**不要**在 16d 内部再正负交替。
-  * Co3O4：8a Co2+ 反铁磁（正负交替），16d Co3+ 低自旋=0。
-- **岩盐 MO**（NiO/CoO/MnO/FeO）：II 型反铁磁，磁性亚晶格 (111) 面内铁磁、面间反铁磁，
-  用 magnetic_order="afm" 或 afm_elements 指定。
-- **闪锌矿 / 纤锌矿 AB**：阳离子四配位。ZnS/ZnO/GaAs/CdTe 等 d10 体系非磁；
-  磁性代表 MnS/MnSe/MnTe（Mn2+ 5，反铁磁）。
-- **钙钛矿 ABO3**：B 位过渡金属(CN=6)承担磁矩；A 位(La/Sr/Ba/Ca/稀土, CN≥8)通常 0。
-  LaMnO3 (A 型反铁磁)、LaFeO3/BiFeO3/LaCrO3 (G 型反铁磁)。
-- **双钙钛矿 A2BB'O6**：B/B' 有序时通常反平行（亚铁磁），如 Sr2FeMoO6：Fe +5、Mo -1；
-  La2NiMnO6：Ni2+ +2 与 Mn4+ +3 铁磁（同号）。
-- **LDH / 氢氧化物 M(OH)2**：层板为共边八面体 M(OH)6，磁矩只来自层板金属 M2+/M3+，
-  层间阴离子（CO3^2-/NO3^-/Cl^-）与水一律 0；LDH 层板内常为铁磁或自旋玻璃，
-  可用正磁矩，也可用 magnetic_order 指定反铁磁。
-- **刚玉 A2O3**：Cr2O3/Fe2O3 反铁磁。**金红石 MO2**：CrO2 铁磁，MnO2 反铁磁。
-- 若知识库 lookup_known_material 命中，优先采用其建议；如与结构信息冲突，以结构信息为准。
-
-## slab / 表面（重要）
-- analyze_structure 会给出 system_type（bulk/slab/mole）、真空层方向、分层数与每个位点的
-  role：bulk / interior / surface_top / surface_bottom / subsurface / cluster。
-- slab 的上下表面必然配位不饱和（如八面体 6 配位降到 5、四面体 4 降到 3）。
-  工具在匹配 coordination 时会自动把表面低配位位点回退到体相“母位点”的规则，因此你
-  可以只按体相配位数（如 4/6）写规则，表面自动继承。
-- 若想让表面与内部不同，可用 site_role 单独写规则，例如：
-  {"element":"Fe","site_role":"surface","moment":5.4} 放在体相规则之前。
-- 金属 slab 表面磁矩常因配位降低而增强（约 +10%~30%），可在表面规则里适当放大；
-  氧化物/离子晶体通常保持价态不变，表面与内部给相同磁矩即可。
-- LDH 单层、二维材料都按 slab 处理；分子/团簇按 cluster 处理。
-
-## 磁序设置
-- 调用 submit_magmom 时可传 magnetic_order：
-  * "ferromagnetic"：所有非零磁矩取正；
-  * "antiferromagnetic"：对磁性元素自动正负交替（fcc 用磁层投影，bcc 用二部图）；
-  * "ferrimagnetic"：按你写的 assignments 正负号（尖晶石/双钙钛矿常用）；
-  * "nonmagnetic"：全部 0，ISPIN=1。
-- 也可用 afm_elements 只对特定亚晶格交替，或在 assignments 里直接写带负号的 moment。
-
-## 工作流程（必须遵守）
-1. 先调用 analyze_structure 查看结构（体系类型、位点 role、配位数、结构基元、知识库匹配）。
-2. 对磁性过渡金属/稀土可调用 get_element_info；对常见材料调用 lookup_known_material。
-3. 组装 assignments（元素 + 可选 coordination + 可选 site_role），必要时设定 magnetic_order。
-4. 可先调用 preview_magmom 检查（尤其确认尖晶石 8a/16d、slab 表面位点是否给对）。
-5. 确认无误后调用 submit_magmom 提交，并写一句中文 rationale。
-
-只输出工具调用，不要输出额外长篇解释。所有数值用 μB。"""
-
-
 def build_user_prompt(pos: Poscar, poscar_text: str, hint: str = "") -> str:
     text = poscar_text
     if len(text) > 8000:
         text = text[:8000] + "\n... (POSCAR 已截断，完整信息以 analyze_structure 工具结果为准)"
     prompt = (
-        "请为下面这个 POSCAR 设置 ISPIN=2 的 MAGMOM 初猜，"
+        "请为下面这个 POSCAR 设置一致的 ISPIN / MAGMOM 初猜，"
         "重点处理过渡金属的价态与晶体学位点、以及可能的反铁磁/亚铁磁序。\n\n"
         f"POSCAR 内容：\n```\n{text}\n```\n"
     )
@@ -2756,17 +2639,17 @@ def build_user_prompt(pos: Poscar, poscar_text: str, hint: str = "") -> str:
 
 
 # ============================================================================
-# 4. OpenAI 兼容客户端（仅标准库 urllib）
+# 13. OpenAI 兼容客户端（仅标准库 urllib）
 # ============================================================================
 class LLMClient:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://api.deepseek.com/v1",
-        model: str = "deepseek-chat",
-        timeout: int = 180,
-        temperature: float = 0.2,
-        max_retries: int = 3,
+        base_url: str = LLM_BASE_URL,
+        model: str = LLM_MODEL,
+        timeout: int = LLM_TIMEOUT,
+        temperature: float = LLM_TEMPERATURE,
+        max_retries: int = LLM_MAX_RETRIES,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -2820,35 +2703,37 @@ def build_client_from_args(args) -> LLMClient:
         or os.environ.get("LLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
         or os.environ.get("DEEPSEEK_API_KEY")
-        or ""
+        or LLM_API_KEY
     )
     base_url = (
         args.base_url
         or os.environ.get("LLM_BASE_URL")
         or os.environ.get("OPENAI_BASE_URL")
-        or "https://api.deepseek.com/v1"
+        or LLM_BASE_URL
     )
     model = (
         args.model
         or os.environ.get("LLM_MODEL")
-        or "deepseek-chat"
+        or LLM_MODEL
     )
     if not api_key:
         raise RuntimeError(
             "未找到 API Key。请设置 LLM_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY，"
             "或用 --api-key 指定；也可以用 --no-llm 走内置启发式。"
         )
-    return LLMClient(api_key, base_url=base_url, model=model, temperature=args.temperature)
+    return LLMClient(api_key, base_url=base_url, model=model,
+                     temperature=args.temperature, timeout=args.timeout,
+                     max_retries=args.max_retries)
 
 
 # ============================================================================
-# 5. Agent 主循环
+# 14. Agent 主循环
 # ============================================================================
 def run_agent(
     client: LLMClient,
     runtime: ToolRuntime,
     user_prompt: str,
-    max_steps: int = 8,
+    max_steps: int = LLM_MAX_STEPS,
     verbose: bool = True,
 ) -> Optional[Dict]:
     messages: List[Dict] = [
@@ -2871,8 +2756,11 @@ def run_agent(
                 print(f"[LLM] 未再调用工具，返回文本：{content[:300]}", file=sys.stderr)
             parsed = _try_parse_content_plan(content)
             if parsed:
-                runtime.submitted = parsed
-                return parsed
+                result = runtime.call("submit_magmom", parsed)
+                if result.get("ok"):
+                    return runtime.submitted
+                messages.append({"role": "user", "content": "方案校验失败，请修正：" + str(result.get("error"))})
+                continue
             break
 
         for tc in tool_calls:
@@ -2920,7 +2808,7 @@ def _try_parse_content_plan(content: str) -> Optional[Dict]:
 
 
 # ============================================================================
-# 6. 输出 / CLI
+# 15. 输出 / CLI
 # ============================================================================
 def finalize(
     pos: Poscar,
@@ -2933,17 +2821,13 @@ def finalize(
 ) -> str:
     if plan:
         moments, warnings = plan_from_llm_args(pos, runtime.report, plan)
-        ispin = int(plan.get("ispin", 2) or 2)
-        if str(plan.get("magnetic_order", "")).lower() in (
-            "nonmagnetic", "non-magnetic", "nm"
-        ):
-            ispin = 1
+        ispin = resolve_ispin(moments, plan.get("ispin"))
         rationale = plan.get("rationale", "")
         source = "LLM 工具调用"
     else:
         moments, rationale = heuristic_plan(pos, runtime.report)
         warnings = validate_moments(moments, pos.n_atoms)
-        ispin = 2
+        ispin = resolve_ispin(moments)
         source = "内置启发式回退"
 
     block = format_magmom(pos, moments, ispin=ispin)
@@ -2970,18 +2854,8 @@ def finalize(
     print("=" * 72)
 
     if do_write:
-        if os.path.exists(incar):
-            try:
-                old = open(incar, "r", encoding="utf-8", errors="ignore").read()
-            except OSError:
-                old = ""
-            if "MAGMOM" in old.upper() or "ISPIN" in old.upper():
-                print(
-                    f"[提示] {incar} 中已存在 ISPIN/MAGMOM，本次为追加写入；"
-                    "如需替换请先手动清理旧参数。"
-                )
         append_to_incar(block, incar)
-        print(f"已追加写入: {incar}")
+        print(f"已更新自旋参数: {incar}")
 
     return block
 
@@ -2991,40 +2865,44 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="用 LLM 工具调用为 POSCAR 生成 VASP MAGMOM 初猜"
     )
     ap.add_argument("poscar", nargs="?", default="POSCAR", help="POSCAR 文件路径")
-    ap.add_argument("--incar", default="INCAR", help="要追加写入的 INCAR（默认 INCAR）")
+    ap.add_argument("--incar", default="INCAR", help="要更新自旋参数的 INCAR（默认 INCAR）")
     ap.add_argument("--print", dest="do_print", action="store_true", help="只打印不写文件")
     ap.add_argument("--no-llm", action="store_true", help="不调用 LLM，直接用内置启发式")
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--base-url", default=None)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--temperature", type=float, default=0.2)
-    ap.add_argument("--max-steps", type=int, default=8)
+    ap.add_argument("--temperature", type=float, default=LLM_TEMPERATURE)
+    ap.add_argument("--timeout", type=float, default=LLM_TIMEOUT, help="单次 LLM 请求超时秒数")
+    ap.add_argument("--max-retries", type=int, default=LLM_MAX_RETRIES)
+    ap.add_argument("--max-steps", type=int, default=LLM_MAX_STEPS)
     ap.add_argument("--hint", default="", help="给 LLM 的补充说明（如已知价态/磁性）")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--vacuum-threshold", type=float, default=5.0,
                     help="bulk/slab 判别的真空层阈值 (Å)，默认 5.0")
-    ap.add_argument("--self-test", action="store_true",
-                    help="运行内置物理自检后退出")
-    ap.add_argument("--make-examples", metavar="DIR", default=None,
-                    help="把内置示例 POSCAR 导出到目录后退出")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if not math.isfinite(args.temperature) or not 0 <= args.temperature <= 2:
+        ap.error("--temperature 必须在 0 到 2 之间")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout 必须为正数")
+    if args.max_retries < 1 or args.max_steps < 1:
+        ap.error("--max-retries 和 --max-steps 必须为正整数")
+    if not math.isfinite(args.vacuum_threshold) or args.vacuum_threshold <= 0:
+        ap.error("--vacuum-threshold 必须为正数")
+    return args
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     global _ACTIVE_VACUUM_THRESHOLD
     _ACTIVE_VACUUM_THRESHOLD = args.vacuum_threshold
-    if args.self_test:
-        return run_self_test()
-    if args.make_examples:
-        return export_examples(args.make_examples)
     if not os.path.exists(args.poscar):
         print(f"找不到 POSCAR: {args.poscar}", file=sys.stderr)
         return 2
 
     pos = parse_poscar_full(args.poscar)
     runtime = ToolRuntime(pos)
-    poscar_text = open(args.poscar, "r", encoding="utf-8", errors="ignore").read()
+    with open(args.poscar, "r", encoding="utf-8") as f:
+        poscar_text = f.read()
     plan: Optional[Dict] = None
 
     if not args.no_llm:
@@ -3047,100 +2925,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-
-# ============================================================================
-# 12. 内置自检 与 示例导出
-# ============================================================================
-def run_self_test(verbose: bool = True) -> int:
-    """不依赖网络/ase 的内置自检。"""
-    failures: List[str] = []
-
-    def check(name, cond, detail):
-        status = "OK" if cond else "FAIL"
-        if not cond:
-            failures.append(f"{name}: {detail}")
-        if verbose:
-            print(f"[{status}] {name}: {detail}")
-
-    def plan(name):
-        text = EXAMPLE_POSCARS[name]
-        pos = parse_poscar_text(text)
-        rep = analyze_structure(pos)
-        mom, _ = heuristic_plan(pos, rep)
-        return pos, rep, mom
-
-    # 纯金属
-    _, rep, mom = plan("Pt_fcc")
-    check("Pt_fcc", all(abs(x) < 1e-9 for x in mom), f"M={mom}")
-    _, rep, mom = plan("Fe_bcc")
-    check("Fe_bcc", all(x > 0 for x in mom), f"M={mom}")
-
-    # 岩盐反铁磁
-    pos, rep, mom = plan("NiO")
-    ni = [mom[i] for i, s in enumerate(pos.symbols) if s == "Ni"]
-    check("NiO", any(x > 0 for x in ni) and any(x < 0 for x in ni), f"Ni={ni}")
-
-    # slab
-    pos, rep, mom = plan("NiO_001_slab")
-    ni = [mom[i] for i, s in enumerate(pos.symbols) if s == "Ni"]
-    check("NiO(001) slab",
-          rep["system_type"] == "slab" and any(x > 0 for x in ni) and any(x < 0 for x in ni),
-          f"type={rep['system_type']} Ni={ni}")
-
-    # 闪锌矿 / 纤锌矿
-    _, rep, mom = plan("ZnS_zincblende")
-    check("ZnS zincblende",
-          rep["motif"]["family"] == "zincblende" and all(abs(x) < 1e-9 for x in mom), f"M={sorted(set(mom))}")
-    _, rep, mom = plan("ZnO_wurtzite")
-    check("ZnO wurtzite",
-          rep["motif"]["family"] == "wurtzite" and all(abs(x) < 1e-9 for x in mom), f"M={sorted(set(mom))}")
-
-    # 钙钛矿
-    pos, rep, mom = plan("LaFeO3")
-    fe = [mom[i] for i, s in enumerate(pos.symbols) if s == "Fe"]
-    check("LaFeO3 perovskite",
-          rep["motif"]["family"] == "perovskite" and fe and all(abs(x) > 1e-9 for x in fe), f"Fe={fe}")
-
-    # LDH
-    pos, rep, mom = plan("NiAl_LDH")
-    ni = [mom[i] for i, s in enumerate(pos.symbols) if s == "Ni"]
-    others = [mom[i] for i, s in enumerate(pos.symbols) if s in ("O", "H", "Al")]
-    check("NiAl-LDH",
-          rep["motif"]["family"] == "ldh" and any(abs(x) > 1e-9 for x in ni)
-          and all(abs(x) < 1e-9 for x in others),
-          f"Ni={ni} others={sorted(set(others))}")
-
-    # 尖晶石 / 反尖晶石
-    pos, rep, mom = plan("Fe3O4")
-    neigh = coordination_analysis(pos)
-    tet = {mom[i] for i, s in enumerate(pos.symbols) if s == "Fe" and len(neigh[i]) == 4}
-    octa = {mom[i] for i, s in enumerate(pos.symbols) if s == "Fe" and len(neigh[i]) == 6}
-    check("Fe3O4 inverse spinel", tet == {5.0} and octa == {-5.0}, f"tet={tet} oct={octa}")
-
-    pos, rep, mom = plan("MgAl2O4")
-    check("MgAl2O4 normal spinel",
-          rep["motif"]["family"] == "spinel" and all(abs(x) < 1e-9 for x in mom),
-          f"M={sorted(set(mom))}")
-
-    print("-" * 60)
-    if failures:
-        print("自检失败:")
-        for f in failures:
-            print("  -", f)
-        return 1
-    print("全部自检通过 ✅")
-    return 0
-
-
-def export_examples(outdir: str) -> int:
-    os.makedirs(outdir, exist_ok=True)
-    for name, text in EXAMPLE_POSCARS.items():
-        path = os.path.join(outdir, f"POSCAR_{name}")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-        print("wrote", path)
-    return 0
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except (ValueError, OSError) as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
+    # Windows 的默认代码页可能无法输出 Å/μB；管道和终端统一使用 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     raise SystemExit(main())
